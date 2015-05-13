@@ -2,6 +2,7 @@
 /*
 * Solar charge controller for 6 volt lead acid batteries
 */
+
 #include <EEPROM.h>
 #include <Wire.h>
 #include "TimerOne.h"
@@ -38,7 +39,7 @@
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
 
-
+#define BULK_RESCAN_TIME 30000                         // Time between rescans (10 ms ticks)
 #define BULK_POWER_DIP_TIME 5000                       // Time to wait to validate a power dip in bulk charging mode
 #define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
@@ -84,6 +85,7 @@ typedef struct {
   volatile uint8_t ticks;
   volatile uint8_t scan;
   volatile uint16_t charge;
+  volatile uint16_t charge10;
 } timer_t;
 
 // A place to store inputs and filtered versions of inputs
@@ -220,6 +222,8 @@ void isr_timer1()
   // Tell foreground to re-acquire sensor values every 10 mSec.
   if(timer.ticks >= 9){
     //digitalWrite(PROFILEPIN, true);
+    if(timer.charge10)
+      timer.charge10--;
     timer.acquire = true;
     timer.ticks = 0;
     //digitalWrite(PROFILEPIN, false);
@@ -689,8 +693,7 @@ void converter_ctrl_loop(void)
       break;
       
     case CONVSTATE_SCAN_START:
-      converter.max_power = 0;
-      converter.pwm_max_power = 0;
+      converter_pwm_set(converter.pwm_max_power = converter.max_power = 0);
       timer.scan = 0;
       converter.state = CONVSTATE_SCAN;
       break;
@@ -713,14 +716,8 @@ void converter_ctrl_loop(void)
           if(converter_pwm_set(converter.pwm + 1)){
             // At max duty cycle, stop the scan
             converter.state = CONVSTATE_BULK;
+            set_timer(&timer.charge10, BULK_RESCAN_TIME);
             break;
-          }
-          if((converter.pwm_max_power > 0) &&
-            (converter.pwm_max_power < converter.pwm) && 
-            (sensor_values.conv_power_mw < (converter.max_power * 9)/ 10)){
-              // Terminate early if we passed the peak
-              converter.state = CONVSTATE_BULK;
-              break;
           }
           timer.scan = 20;
         }    
@@ -744,6 +741,11 @@ void converter_ctrl_loop(void)
       
     case CONVSTATE_BULK:
     case CONVSTATE_BULK_POWER_DIP:
+      if(!read_timer(&timer.charge10)){
+        converter.state = CONVSTATE_SCAN_START;
+        break;
+      }
+
       if(CONVSTATE_BULK == converter.state){
         // If power dips below 90% of the scan value, or the pv voltage dips start a timer
         if((sensor_values.conv_power_mw < (converter.pwm_max_power * 9)/10) || 
@@ -758,19 +760,15 @@ void converter_ctrl_loop(void)
           converter.state = CONVSTATE_SCAN_START;
           break;
         }
-        // If power goes back over 90% of previous scan value and the pv voltage is good, return to bulk state
-        else if((sensor_values.conv_power_mw >= (converter.pwm_max_power * 9)/10) &&
-          (sensor_values.pv_mv_filt >= SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV))
-          converter.state = CONVSTATE_BULK;    
       }
-      
+ 
       converter_pwm_set(converter.pwm_max_power);
       if(sensor_values.batt_mv_filt >= END_BULK_CHARGE_MILLIVOLTS){
           // Exit bulk charging and go to absorbtion charging mode
           set_timer(&timer.charge, BULK_TO_ABSORB_TIME);
           converter.state = CONVSTATE_BULK_ABSORB;
       }    
-      break;
+      break;   
      
     case CONVSTATE_BULK_ABSORB:
       // Hold in bulk for a set time before transferring to absorb.
@@ -781,7 +779,7 @@ void converter_ctrl_loop(void)
         converter.state = CONVSTATE_ABSORB;
       else if((sensor_values.conv_power_mw < (converter.pwm_max_power * 9)/10) || 
         (sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV)){
-        converter.state = CONVSTATE_BULK;
+        converter.state = CONVSTATE_SCAN_START;
       }  
     
       break;
@@ -792,7 +790,7 @@ void converter_ctrl_loop(void)
       converter.end_absorb_mv,
       ABSORB_WAIT_TIME,
       CONVSTATE_ABSORB,
-      CONVSTATE_SCAN,
+      CONVSTATE_SCAN_START,
       CONVSTATE_FLOAT);
       break;
     
@@ -841,14 +839,14 @@ void loop()
         break;
       // Start PV voltage calibration  
       case CMD_CALIB_PV_VOLTS:
-	    if(converter.calibrate && (CALIB_IDLE == calib.state)){
+	      if(converter.calibrate && (CALIB_IDLE == calib.state)){
            calib.state = CALIB_PVV_START;
         }
         break;
 	   
       // Start Battery voltage calibration
       case CMD_CALIB_BATT_VOLTS:
-	    if(converter.calibrate && (CALIB_IDLE == calib.state)){
+	      if(converter.calibrate && (CALIB_IDLE == calib.state)){
            calib.state = CALIB_BV_START;
         }
         break;  
@@ -938,11 +936,11 @@ void loop()
   if(ticks++ >= 99){
     // This is a debug aid. It prints out variables every second.
     ticks = 0;
-    debug(0, "Battery Millivolts raw %u", sensor_values.batt_mv);
+    //debug(0, "Battery Millivolts raw %u", sensor_values.batt_mv);
     debug(0, "Battery Millivolts filtered %u", sensor_values.batt_mv_filt);
-    debug(0, "PV Millivolts raw %u", sensor_values.pv_mv);
+    //debug(0, "PV Millivolts raw %u", sensor_values.pv_mv);
     debug(0, "PV Millivolts filtered %u", sensor_values.pv_mv_filt);
-    debug(0, "Converter Milliamps raw %u", sensor_values.conv_ma);
+    //debug(0, "Converter Milliamps raw %u", sensor_values.conv_ma);
     debug(0, "Converter Milliamps filtered %u", sensor_values.conv_ma_filt);
     debug(0, "Load Milliamps filtered %u", sensor_values.load_ma_filt);
     debug(0, "Battery Milliamps filtered %i", sensor_values.batt_ma_filt);
@@ -951,6 +949,7 @@ void loop()
     //debug(0, "Battery power %u mW", sensor_values.batt_power_mw);
     debug(0, "Converter state %u", converter.state);
     //debug(0, "Servo current state %u", converter.servocurrentstate);
+    debug(0, "Converter power point pwm %u", converter.pwm_max_power);
     debug(0, "Converter pwm %u", converter.pwm);
     //debug(0, "Converter temperature offset %u", converter.tempoffset);
     //debug(0, "Charge timer: %u", read_timer(&timer.charge));
