@@ -246,18 +246,6 @@ void i2c_receive(int count)
 }
 
 /*
-* I2C Transmit event
-*/
-
-void i2c_transmit()
-{
-  // Send the length and what is in the TX buffer
-  Wire.write((uint8_t *) &i2c.tx, i2c.tx.length + 2);
-  digitalWrite(DATA_READY, false); 
-}
-
-
-/*
 * Print a debug message to the serial port
 */
 
@@ -273,6 +261,19 @@ void debug(uint8_t level, const char *format, ...)
   }
   va_end(ap);
 }
+
+
+/*
+* I2C Transmit event
+*/
+
+void i2c_transmit()
+{
+  // Send the length and what is in the TX buffer
+  Wire.write((uint8_t *) &i2c.tx, i2c.tx.length + 2);
+  digitalWrite(DATA_READY, false); 
+}
+
 
 
 /*
@@ -823,12 +824,14 @@ void loop()
   uint16_t *values;
   
   if(i2c.cmd_received){ // Process command
+    i2c.cmd_received = false;
     // Zero out the request buffer
     memset(i2c.tx.buffer,0,sizeof(i2c.tx.buffer));
     // Act on command
     i2c.tx.command = i2c.command;
     switch(i2c.command){
       default:
+        i2c.tx.length = 0;
         break;
       // Enter calibration
       case CMD_CALIB_ENTER:
@@ -937,23 +940,23 @@ void loop()
     // This is a debug aid. It prints out variables every second.
     ticks = 0;
     //debug(0, "Battery Millivolts raw %u", sensor_values.batt_mv);
-    debug(0, "Battery Millivolts filtered %u", sensor_values.batt_mv_filt);
+    //debug(0, "Battery Millivolts filtered %u", sensor_values.batt_mv_filt);
     //debug(0, "PV Millivolts raw %u", sensor_values.pv_mv);
-    debug(0, "PV Millivolts filtered %u", sensor_values.pv_mv_filt);
+    //debug(0, "PV Millivolts filtered %u", sensor_values.pv_mv_filt);
     //debug(0, "Converter Milliamps raw %u", sensor_values.conv_ma);
-    debug(0, "Converter Milliamps filtered %u", sensor_values.conv_ma_filt);
-    debug(0, "Load Milliamps filtered %u", sensor_values.load_ma_filt);
-    debug(0, "Battery Milliamps filtered %i", sensor_values.batt_ma_filt);
-    debug(0, "Converter power %u mW", sensor_values.conv_power_mw);
+    //debug(0, "Converter Milliamps filtered %u", sensor_values.conv_ma_filt);
+    //debug(0, "Load Milliamps filtered %u", sensor_values.load_ma_filt);
+    //debug(0, "Battery Milliamps filtered %i", sensor_values.batt_ma_filt);
+    //debug(0, "Converter power %u mW", sensor_values.conv_power_mw);
     //debug(0, "Load power %u mW", sensor_values.load_power_mw);
     //debug(0, "Battery power %u mW", sensor_values.batt_power_mw);
-    debug(0, "Converter state %u", converter.state);
+    //debug(0, "Converter state %u", converter.state);
     //debug(0, "Servo current state %u", converter.servocurrentstate);
-    debug(0, "Converter power point pwm %u", converter.pwm_max_power);
-    debug(0, "Converter pwm %u", converter.pwm);
+    //debug(0, "Converter power point pwm %u", converter.pwm_max_power);
+    //debug(0, "Converter pwm %u", converter.pwm);
     //debug(0, "Converter temperature offset %u", converter.tempoffset);
     //debug(0, "Charge timer: %u", read_timer(&timer.charge));
-    debug(0,"\r\n");
+    //debug(0,"\r\n");
     
   }
 }
