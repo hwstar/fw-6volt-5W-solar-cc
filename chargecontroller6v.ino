@@ -32,10 +32,12 @@
 #define CELLS 3
 #define BATTERY_DISCHARGED_MILLIVOLTS CELLS * 1800     // Battery completely discharged
 #define END_BULK_CHARGE_MILLIVOLTS CELLS * 2310        // End bulk charge at 293K mv
-#define BATTERY_FLOAT_MILLIVOLTS CELLS * 2400          // Absorbtion stage end 293K
+#define BATTERY_END_ABSORB_MILLIVOLTS CELLS * 2400     // Absorbtion stage end 293K
+#define FLOAT_HOLD_MV CELLS * 2280                     // Float holding voltage 293K
 #define BATTERY_GASSING_MILLIVOLTS CELLS * 2415        // Gassing at 293K mv
-#define BATTERY_MAH 1300                               // Battery capacity in mAH
-#define BATTERY_FLOAT_CURRENT 30                       // Battery float current in mA
+
+#define MIN_CONV_POWER 100                             // Need to see this minimum power to go into bulk mode from scan
+#define BATTERY_MAH 4500                               // Battery capacity in mAH
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
 
@@ -43,7 +45,7 @@
 #define BULK_POWER_DIP_TIME 5000                       // Time to wait to validate a power dip in bulk charging mode
 #define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
-#define FLOAT_WAIT_TIME 5000                           // Time to wait in float state before going to previous state
+#define FLOAT_EXIT_TIME 5000                           // Time to wait in float state before going to previous state
 //#define SWITCH_ON_TIME 30000                         // Number of milliseconds pv voltage needs to be above threshold switch on
 #define SWITCH_ON_TIME 5000
 #define SWITCH_OFF_TIME 5000                           // Number of milliseconds pv voltage needs to be under threshold to switch off
@@ -51,7 +53,7 @@
 #define SWITCH_ON_MILLIVOLTS 7500                      // Threshold to switch converter on from sleep mode
 
 #define SLEEP_HYST_MV 50                               // Voltage hysteresis to switch in and out of sleep mode
-#define HYST_SERVO_BY_CURRENT 100                      // Voltage hysteresis to switch to the next state in servo_by_current
+#define FLOAT_HYST 50                                  // Voltage hysteresis used during float charging stage
 
 #define CONVERTER_PWM_CLIP 0xF0                        // Clip at current limit
 
@@ -70,10 +72,11 @@
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
 
 
-enum {CMD_NOP = 0, CMD_CALIB_ENTER, CMD_CALIB_WRITE_EXIT, CMD_CALIB_EXIT, 
-CMD_CALIB_PV_VOLTS, CMD_CALIB_BATT_VOLTS, CMD_CALIB_RETURN_STATE,
-CMD_CALIB_RETURN_VALUES, CMD_LOAD_ENABLE, CMD_LOAD_DISABLE,
-CMD_RETURN_SENSOR_VALUES, CMD_RETURN_CHARGE_MODE};
+enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE_EXIT=2, CMD_CALIB_EXIT=3, 
+CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
+CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
+CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
+CMD_RETURN_CONV_INFO=12};
 enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, CALIB_BV_START, CALIB_BV_WAIT};
 enum {LEDC_OFF = 0, LEDC_ON, LED_FLASH_FAST};
 enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF};
@@ -120,6 +123,7 @@ typedef struct {
   uint16_t end_bulk_mv;
   uint16_t end_absorb_mv;
   uint16_t gassing_mv;
+  uint16_t float_hold_mv;
   
 } converter_t;
 
@@ -474,6 +478,9 @@ void update_values(void)
   sensor_values.load_ma_filt = ((sensor_values.load_ma_filt * 15) + sensor_values.load_ma) >> 4; 
   sensor_values.battery_temp_filt = ((sensor_values.battery_temp_filt * 15) + sensor_values.battery_temp) >> 4; 
   
+  
+ 
+  
   // Derive battery milliamps
   sensor_values.batt_ma_filt = sensor_values.conv_ma_filt - sensor_values.load_ma_filt;
   
@@ -484,8 +491,12 @@ void update_values(void)
   // Calculate load power in milliwatts
   sensor_values.load_power_mw = (sensor_values.load_ma_filt * sensor_values.batt_mv_filt)/1000;
   
-   // Calculate battery power in milliwatts
-  sensor_values.batt_power_mw = (sensor_values.batt_ma_filt * sensor_values.batt_mv_filt)/1000;
+  // Calculate battery power in milliwatts
+  uint16_t batt_ma_abs = sensor_values.batt_ma_filt;
+  if(sensor_values.batt_ma_filt < 0)
+    batt_ma_abs = sensor_values.batt_ma_filt * -1;
+
+  sensor_values.batt_power_mw = (batt_ma_abs * sensor_values.batt_mv_filt)/1000;
   
   digitalWrite(PROFILEPIN, false);
  
@@ -507,13 +518,13 @@ uint8_t normstate, uint8_t prevstate, uint8_t nextstate)
   switch(converter.servocurrentstate){
     case SRVCS_START:
       // See if battery voltage decreased to go to the previous state
-      if(sensor_values.batt_mv_filt <= termvoltsprev - HYST_SERVO_BY_CURRENT){
+      if(sensor_values.batt_mv_filt <= termvoltsprev ){
         set_timer(&timer.charge, termms);
         converter.servocurrentstate = SRVCS_UNDERVOLT;
         break;
       }
       // See if battery voltage increased to go to the next state
-      else if(sensor_values.batt_mv_filt >= termvoltsnext + HYST_SERVO_BY_CURRENT){
+      else if(sensor_values.batt_mv_filt >= termvoltsnext){
         set_timer(&timer.charge, termms);
         converter.servocurrentstate = SRVCS_OVERVOLT;
         break;
@@ -523,7 +534,7 @@ uint8_t normstate, uint8_t prevstate, uint8_t nextstate)
     case SRVCS_UNDERVOLT:
       // If greater than the previous state termination voltage, stop timing the transition
       // and return to the starting current state. 
-      if(sensor_values.batt_mv_filt > termvoltsprev - HYST_SERVO_BY_CURRENT){
+      if(sensor_values.batt_mv_filt > termvoltsprev ){
         converter.servocurrentstate = SRVCS_START;
         break;
       }
@@ -538,7 +549,7 @@ uint8_t normstate, uint8_t prevstate, uint8_t nextstate)
     case SRVCS_OVERVOLT:
       // If less than the next state termination voltage, stop timing the transition,
       // and return to the starting current state.
-      if(sensor_values.batt_mv_filt < termvoltsnext + HYST_SERVO_BY_CURRENT){
+      if(sensor_values.batt_mv_filt < termvoltsnext ){
         converter.servocurrentstate = SRVCS_START;
         break;
       }
@@ -553,12 +564,15 @@ uint8_t normstate, uint8_t prevstate, uint8_t nextstate)
   
 
   // Servo to current unless voltage at terminal value. 
-  // If the voltage hits the terminal value + 100mV, back off on the pwm duty cycle.
-  if((sensor_values.batt_ma_filt > (current + current_hyst))||(sensor_values.batt_mv_filt > (termvoltsnext)))
+  if(sensor_values.batt_mv_filt < converter.gassing_mv){
+    if((sensor_values.batt_ma_filt > (current + current_hyst)))
+      converter_pwm_set(converter.pwm - 1);
+    else if(sensor_values.batt_ma_filt < (current - current_hyst))
+      converter_pwm_set(converter.pwm + 1);
+  }
+  else{
     converter_pwm_set(converter.pwm - 1);
-  else if(sensor_values.batt_ma_filt < (current - current_hyst))
-    converter_pwm_set(converter.pwm + 1);  
- 
+  }
 }
 
 
@@ -644,7 +658,7 @@ void do_calib(void)
 
 
 enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, CONVSTATE_SCAN_START, CONVSTATE_SCAN, CONVSTATE_VOLTAGE_DIP, 
-CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB, CONVSTATE_ABSORB, CONVSTATE_FLOAT};
+CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB, CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, CONVSTATE_FLOAT_EXIT};
 
 void converter_ctrl_loop(void)
 {
@@ -655,8 +669,9 @@ void converter_ctrl_loop(void)
   
   // Set values for termination voltages based on temperature
   converter.end_bulk_mv = END_BULK_CHARGE_MILLIVOLTS + converter.tempoffset;
-  converter.end_absorb_mv = BATTERY_FLOAT_MILLIVOLTS + converter.tempoffset;
+  converter.end_absorb_mv = BATTERY_END_ABSORB_MILLIVOLTS + converter.tempoffset;
   converter.gassing_mv = BATTERY_GASSING_MILLIVOLTS + converter.tempoffset;
+  converter.float_hold_mv = FLOAT_HOLD_MV + converter.tempoffset;
   
 
   switch(converter.state)
@@ -713,11 +728,21 @@ void converter_ctrl_loop(void)
             // We noted an increase in power
             converter.max_power = sensor_values.conv_power_mw;
             converter.pwm_max_power = converter.pwm;
-          }  
-          if(converter_pwm_set(converter.pwm + 1)){
+          }
+          // Increase PWM duty cycle by one count, but  
+          // cut scan short if gassing voltage is reached.
+          if((converter_pwm_set(converter.pwm + 1)) ||
+            sensor_values.batt_mv_filt > converter.gassing_mv ){
             // At max duty cycle, stop the scan
-            converter.state = CONVSTATE_BULK;
-            set_timer(&timer.charge10, BULK_RESCAN_TIME);
+            // Ensure it is over the minimum power
+            if(converter.max_power < MIN_CONV_POWER){
+              converter.state = CONVSTATE_OFF;
+              break;
+            }
+            else{
+              converter.state = CONVSTATE_BULK;
+              set_timer(&timer.charge10, BULK_RESCAN_TIME);
+            }
             break;
           }
           timer.scan = 20;
@@ -764,7 +789,7 @@ void converter_ctrl_loop(void)
       }
  
       converter_pwm_set(converter.pwm_max_power);
-      if(sensor_values.batt_mv_filt >= END_BULK_CHARGE_MILLIVOLTS){
+      if((sensor_values.batt_mv_filt >= converter.end_bulk_mv) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
           // Exit bulk charging and go to absorbtion charging mode
           set_timer(&timer.charge, BULK_TO_ABSORB_TIME);
           converter.state = CONVSTATE_BULK_ABSORB;
@@ -776,8 +801,9 @@ void converter_ctrl_loop(void)
       // Unless voltage or power dips.
       // If the gassing voltage is reached, terminate early and go to absorb state.
       converter_pwm_set(converter.pwm_max_power);
-      if((!read_timer(&timer.charge)) || (sensor_values.batt_mv_filt > converter.gassing_mv))
+      if((!read_timer(&timer.charge)) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
         converter.state = CONVSTATE_ABSORB;
+      }
       else if((sensor_values.conv_power_mw < (converter.pwm_max_power * 9)/10) || 
         (sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV)){
         converter.state = CONVSTATE_SCAN_START;
@@ -786,24 +812,49 @@ void converter_ctrl_loop(void)
       break;
      
     case CONVSTATE_ABSORB:
+ 
       servo_by_current(BATTERY_MAH/10, 5,
       converter.end_bulk_mv, 
       converter.end_absorb_mv,
       ABSORB_WAIT_TIME,
       CONVSTATE_ABSORB,
       CONVSTATE_SCAN_START,
-      CONVSTATE_FLOAT);
+      CONVSTATE_ABSORB_FLOAT);
       break;
+      
+    case CONVSTATE_ABSORB_FLOAT:
+      // Taper down to float voltage
+      converter_pwm_set(0);
+      if(sensor_values.batt_mv_filt < converter.float_hold_mv + FLOAT_HYST){
+        converter.state = CONVSTATE_FLOAT;
+      }
+      break;
+      
     
     case CONVSTATE_FLOAT:
-      servo_by_current(BATTERY_FLOAT_CURRENT, 5,
-      converter.end_absorb_mv, 
-      converter.gassing_mv,
-      FLOAT_WAIT_TIME,
-      CONVSTATE_FLOAT,
-      CONVSTATE_ABSORB,
-      CONVSTATE_FLOAT);
-   
+    case CONVSTATE_FLOAT_EXIT:
+      // Hold at float charge voltage
+      if(CONVSTATE_FLOAT == converter.state){
+        if(sensor_values.batt_mv_filt < converter.float_hold_mv - (FLOAT_HYST * 2)){
+          converter.state = CONVSTATE_FLOAT_EXIT;
+          timer.charge = FLOAT_EXIT_TIME;
+        }
+      }
+      else{
+        if(sensor_values.batt_mv_filt >= converter.float_hold_mv - (FLOAT_HYST * 2)){
+          converter.state = CONVSTATE_FLOAT;
+          break;
+        }
+        if(!timer.charge){
+          converter.state = CONVSTATE_ABSORB;
+          break;
+        }
+      }
+    
+      if(sensor_values.batt_mv_filt < (converter.float_hold_mv - FLOAT_HYST))
+        converter_pwm_set(converter.pwm + 1);
+      else if(sensor_values.batt_mv_filt > (converter.float_hold_mv + FLOAT_HYST))
+        converter_pwm_set(converter.pwm - 1);
       break; 
   
  
@@ -838,6 +889,7 @@ void loop()
         converter.state = CONVSTATE_INIT;
         digitalWrite(LOADENAPIN, false);
         converter_pwm_set(0);
+        analogWrite(PWMPIN, converter.pwm);
         converter.calibrate = true;
         break;
       // Start PV voltage calibration  
@@ -911,8 +963,11 @@ void loop()
         digitalWrite(DATA_READY, true);
         break;
         
-        
-        
+      case CMD_RETURN_CONV_INFO:
+        i2c.tx.length = sizeof(converter);
+        memcpy(i2c.tx.buffer, &converter, sizeof(converter));
+        digitalWrite(DATA_READY, true);
+        break;
     }
   }
   
