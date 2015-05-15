@@ -740,16 +740,7 @@ void converter_ctrl_loop(void)
       break;
      
     case CONVSTATE_ABSORB:
- 
-//      servo_by_current(BATTERY_MAH/10, 5,
-//      converter.end_bulk_mv, 
-//      converter.end_absorb_mv,
-//      ABSORB_WAIT_TIME,
-//      CONVSTATE_ABSORB,
-//      CONVSTATE_SCAN_START,
-//      CONVSTATE_ABSORB_FLOAT);
-//      break;
-      
+
       switch(converter.servocurrentstate){
         case SRVCS_START:
           // See if battery voltage decreased to go to the previous state
