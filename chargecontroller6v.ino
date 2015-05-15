@@ -502,80 +502,6 @@ void update_values(void)
  
 }
 
-
-/*
-* Servo by current control
-*/
-
-enum {SRVCS_START = 0, SRVCS_UNDERVOLT, SRVCS_OVERVOLT};
-
-void servo_by_current(uint16_t current, uint8_t current_hyst, 
-uint16_t termvoltsprev, uint16_t termvoltsnext, uint16_t termms, 
-uint8_t normstate, uint8_t prevstate, uint8_t nextstate)
-{
-  
-
-  switch(converter.servocurrentstate){
-    case SRVCS_START:
-      // See if battery voltage decreased to go to the previous state
-      if(sensor_values.batt_mv_filt <= termvoltsprev ){
-        set_timer(&timer.charge, termms);
-        converter.servocurrentstate = SRVCS_UNDERVOLT;
-        break;
-      }
-      // See if battery voltage increased to go to the next state
-      else if(sensor_values.batt_mv_filt >= termvoltsnext){
-        set_timer(&timer.charge, termms);
-        converter.servocurrentstate = SRVCS_OVERVOLT;
-        break;
-      } 
-      break;
-      
-    case SRVCS_UNDERVOLT:
-      // If greater than the previous state termination voltage, stop timing the transition
-      // and return to the starting current state. 
-      if(sensor_values.batt_mv_filt > termvoltsprev ){
-        converter.servocurrentstate = SRVCS_START;
-        break;
-      }
-      if(!read_timer(&timer.charge)){
-        // Timer expired, go to the previous charging state
-        converter.servocurrentstate = SRVCS_START;
-        converter.state = prevstate;
-        break;
-      }
-      break;
-    
-    case SRVCS_OVERVOLT:
-      // If less than the next state termination voltage, stop timing the transition,
-      // and return to the starting current state.
-      if(sensor_values.batt_mv_filt < termvoltsnext ){
-        converter.servocurrentstate = SRVCS_START;
-        break;
-      }
-      if(!read_timer(&timer.charge)){
-        // Timer expired, go to the next charging state
-        converter.servocurrentstate = SRVCS_START;
-        converter.state = nextstate;
-        break;
-      }
-      break;
-  }
-  
-
-  // Servo to current unless voltage at terminal value. 
-  if(sensor_values.batt_mv_filt < converter.gassing_mv){
-    if((sensor_values.batt_ma_filt > (current + current_hyst)))
-      converter_pwm_set(converter.pwm - 1);
-    else if(sensor_values.batt_ma_filt < (current - current_hyst))
-      converter_pwm_set(converter.pwm + 1);
-  }
-  else{
-    converter_pwm_set(converter.pwm - 1);
-  }
-}
-
-
 /* 
 * Calibration code
 */
@@ -659,6 +585,8 @@ void do_calib(void)
 
 enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, CONVSTATE_SCAN_START, CONVSTATE_SCAN, CONVSTATE_VOLTAGE_DIP, 
 CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB, CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, CONVSTATE_FLOAT_EXIT};
+
+enum {SRVCS_START = 0, SRVCS_UNDERVOLT, SRVCS_OVERVOLT};
 
 void converter_ctrl_loop(void)
 {
@@ -813,13 +741,72 @@ void converter_ctrl_loop(void)
      
     case CONVSTATE_ABSORB:
  
-      servo_by_current(BATTERY_MAH/10, 5,
-      converter.end_bulk_mv, 
-      converter.end_absorb_mv,
-      ABSORB_WAIT_TIME,
-      CONVSTATE_ABSORB,
-      CONVSTATE_SCAN_START,
-      CONVSTATE_ABSORB_FLOAT);
+//      servo_by_current(BATTERY_MAH/10, 5,
+//      converter.end_bulk_mv, 
+//      converter.end_absorb_mv,
+//      ABSORB_WAIT_TIME,
+//      CONVSTATE_ABSORB,
+//      CONVSTATE_SCAN_START,
+//      CONVSTATE_ABSORB_FLOAT);
+//      break;
+      
+      switch(converter.servocurrentstate){
+        case SRVCS_START:
+          // See if battery voltage decreased to go to the previous state
+          if(sensor_values.batt_mv_filt <= converter.end_bulk_mv ){
+            set_timer(&timer.charge, ABSORB_WAIT_TIME);
+            converter.servocurrentstate = SRVCS_UNDERVOLT;
+            break;
+          }
+          // See if battery voltage increased to go to the next state
+          else if(sensor_values.batt_mv_filt >= converter.end_absorb_mv){
+            set_timer(&timer.charge, ABSORB_WAIT_TIME);
+            converter.servocurrentstate = SRVCS_OVERVOLT;
+            break;
+          } 
+          break;
+          
+        case SRVCS_UNDERVOLT:
+          // If greater than the previous state termination voltage, stop timing the transition
+          // and return to the starting current state. 
+          if(sensor_values.batt_mv_filt > converter.end_bulk_mv ){
+            converter.servocurrentstate = SRVCS_START;
+            break;
+          }
+          if(!read_timer(&timer.charge)){
+            // Timer expired, go to the previous charging state
+            converter.servocurrentstate = SRVCS_START;
+            converter.state = CONVSTATE_SCAN_START;
+            break;
+          }
+          break;
+        
+        case SRVCS_OVERVOLT:
+          // If less than the next state termination voltage, stop timing the transition,
+          // and return to the starting current state.
+          if(sensor_values.batt_mv_filt < converter.end_absorb_mv ){
+            converter.servocurrentstate = SRVCS_START;
+            break;
+          }
+          if(!read_timer(&timer.charge)){
+            // Timer expired, go to the next charging state
+            converter.servocurrentstate = SRVCS_START;
+            converter.state = CONVSTATE_ABSORB_FLOAT;
+            break;
+          }
+          break;
+      }
+      
+      // Servo to current unless voltage at terminal value. 
+      if(sensor_values.batt_mv_filt < converter.gassing_mv){
+        if((sensor_values.batt_ma_filt > (BATTERY_MAH/10 + 5))) 
+          converter_pwm_set(converter.pwm - 1);
+        else if(sensor_values.batt_ma_filt < (BATTERY_MAH/10 - 5)) 
+          converter_pwm_set(converter.pwm + 1);
+      }
+      else{
+        converter_pwm_set(converter.pwm - 1);
+      }
       break;
       
     case CONVSTATE_ABSORB_FLOAT:
@@ -835,13 +822,15 @@ void converter_ctrl_loop(void)
     case CONVSTATE_FLOAT_EXIT:
       // Hold at float charge voltage
       if(CONVSTATE_FLOAT == converter.state){
-        if(sensor_values.batt_mv_filt < converter.float_hold_mv - (FLOAT_HYST * 2)){
+        if((sensor_values.batt_mv_filt < converter.float_hold_mv - (FLOAT_HYST * 2)||
+          sensor_values.batt_ma_filt > BATTERY_MAH/10)){
           converter.state = CONVSTATE_FLOAT_EXIT;
           timer.charge = FLOAT_EXIT_TIME;
         }
       }
       else{
-        if(sensor_values.batt_mv_filt >= converter.float_hold_mv - (FLOAT_HYST * 2)){
+        if(sensor_values.batt_mv_filt >= converter.float_hold_mv - (FLOAT_HYST * 2)&&
+          (sensor_values.batt_ma_filt < BATTERY_MAH/10)){
           converter.state = CONVSTATE_FLOAT;
           break;
         }
