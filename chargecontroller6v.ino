@@ -59,8 +59,8 @@
 
 #define ANALOG_FULL_SCALE 5000						             // Full scale voltage of an analog input
 
-#define PV_CAL_VOLTAGE 10200						               // PV Calibration test voltage in mv
-#define BATT_CAL_VOLTAGE 7200                          // Battery calibration test voltage in mv
+#define PV_CAL_VOLTAGE 6000						                 // PV Calibration test voltage in mv
+#define BATT_CAL_VOLTAGE 6000                          // Battery calibration test voltage in mv
 
 
 #define EEPROM_CALIB_ADDR 0xE0						             // Offset into EEPROM for calibration data
