@@ -10,6 +10,9 @@
 
 #define TWI_ADDRESS 0x08    // I2C address
 
+
+// Pin definitions
+
 #define BVSENSEPIN 0
 #define PVSENSEPIN 1
 #define BISENSEPIN 2
@@ -21,13 +24,9 @@
 #define PROFILEPIN 10
 #define PWMPIN 11
 #define LOADENAPIN 12
-#define LED 13
+#define LEDPIN 13
 
-
-
-
-
-
+// Battery constants
 
 #define CELLS 3
 #define BATTERY_DISCHARGED_MILLIVOLTS CELLS * 1800     // Battery completely discharged
@@ -37,7 +36,7 @@
 #define BATTERY_GASSING_MILLIVOLTS CELLS * 2415        // Gassing at 293K mv
 
 #define MIN_CONV_POWER 100                             // Need to see this minimum power to go into bulk mode from scan
-#define BATTERY_MAH 4500                               // Battery capacity in mAH
+#define ABSORB_TARGET_CURRENT 450                      // Target current in absorb mode
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
 
@@ -46,14 +45,14 @@
 #define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
 #define FLOAT_EXIT_TIME 5000                           // Time to wait in float state before going to previous state
-//#define SWITCH_ON_TIME 30000                         // Number of milliseconds pv voltage needs to be above threshold switch on
-#define SWITCH_ON_TIME 5000
+#define SWITCH_ON_TIME 5000                          // Number of milliseconds pv voltage needs to be above threshold switch on
 #define SWITCH_OFF_TIME 5000                           // Number of milliseconds pv voltage needs to be under threshold to switch off
 
 #define SWITCH_ON_MILLIVOLTS 7500                      // Threshold to switch converter on from sleep mode
 
 #define SLEEP_HYST_MV 50                               // Voltage hysteresis to switch in and out of sleep mode
 #define FLOAT_HYST 50                                  // Voltage hysteresis used during float charging stage
+#define ABSORB_HYST 5                                  // Current hysteresis used in absorb charging state
 
 #define CONVERTER_PWM_CLIP 0xF0                        // Clip at current limit
 
@@ -66,7 +65,7 @@
 #define EEPROM_CALIB_ADDR 0xE0						             // Offset into EEPROM for calibration data
 #define EEPROM_CALIB_SIG 0x5AA5						             // Calibration signature
 
-#define LED_FAST_BLINK 125                             // 4Hz blink rate
+#define LED_FAST_BLINK 12                              // 240 ms blink period
 
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
@@ -163,7 +162,7 @@ typedef struct {
 /* LED variables */
 typedef struct {
   uint8_t state;
-  uint16_t timer;
+  uint8_t timer;
 } led_t;
 
 /*
@@ -199,17 +198,17 @@ void isr_timer1()
   
   switch(led.state){
       case LEDS_OFF:
-        digitalWrite(LED, false);
+        digitalWrite(LEDPIN, false);
         break;
         
       case LEDS_ON:
-        digitalWrite(LED, true);
+        digitalWrite(LEDPIN, true);
         break;
         
       case LEDS_FF_OFF:
         if(!led.timer){
           led.timer = LED_FAST_BLINK;
-          digitalWrite(LED, true);
+          digitalWrite(LEDPIN, true);
           led.state = LEDS_FF_ON;
         }
         break;
@@ -217,7 +216,7 @@ void isr_timer1()
       case LEDS_FF_ON:
        if(!led.timer){
           led.timer = LED_FAST_BLINK;
-          digitalWrite(LED, false);
+          digitalWrite(LEDPIN, false);
           led.state = LEDS_FF_OFF;
         }
         break;
@@ -230,6 +229,8 @@ void isr_timer1()
       timer.charge10--;
     timer.acquire = true;
     timer.ticks = 0;
+    if(led.timer)
+      led.timer--;
     //digitalWrite(PROFILEPIN, false);
   }
   else
@@ -420,7 +421,9 @@ void setup()
   
   // GPIO Setup
   pinMode(PWMPIN, OUTPUT);   // sets the PWM pin as output
-  pinMode(LOADENAPIN, OUTPUT);
+  pinMode(LEDPIN, OUTPUT);   // sets the LED pin as output
+  digitalWrite(LEDPIN, false);
+  pinMode(LOADENAPIN, OUTPUT); // sets the LOAD enable pin as an output
   digitalWrite(LOADENAPIN, false);
   pinMode(PROFILEPIN, OUTPUT);   // sets the PROFILE pin as output
   
@@ -790,9 +793,9 @@ void converter_ctrl_loop(void)
       
       // Servo to current unless voltage at terminal value. 
       if(sensor_values.batt_mv_filt < converter.gassing_mv){
-        if((sensor_values.batt_ma_filt > (BATTERY_MAH/10 + 5))) 
+        if((sensor_values.batt_ma_filt > (ABSORB_TARGET_CURRENT + ABSORB_HYST))) 
           converter_pwm_set(converter.pwm - 1);
-        else if(sensor_values.batt_ma_filt < (BATTERY_MAH/10 - 5)) 
+        else if(sensor_values.batt_ma_filt < (ABSORB_TARGET_CURRENT - ABSORB_HYST)) 
           converter_pwm_set(converter.pwm + 1);
       }
       else{
@@ -814,14 +817,14 @@ void converter_ctrl_loop(void)
       // Hold at float charge voltage
       if(CONVSTATE_FLOAT == converter.state){
         if((sensor_values.batt_mv_filt < converter.float_hold_mv - (FLOAT_HYST * 2)||
-          sensor_values.batt_ma_filt > BATTERY_MAH/10)){
+          sensor_values.batt_ma_filt > ABSORB_TARGET_CURRENT)){
           converter.state = CONVSTATE_FLOAT_EXIT;
           timer.charge = FLOAT_EXIT_TIME;
         }
       }
       else{
         if(sensor_values.batt_mv_filt >= converter.float_hold_mv - (FLOAT_HYST * 2)&&
-          (sensor_values.batt_ma_filt < BATTERY_MAH/10)){
+          (sensor_values.batt_ma_filt < ABSORB_TARGET_CURRENT)){
           converter.state = CONVSTATE_FLOAT;
           break;
         }
