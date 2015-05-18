@@ -45,8 +45,10 @@
 #define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
 #define FLOAT_EXIT_TIME 5000                           // Time to wait in float state before going to previous state
-#define SWITCH_ON_TIME 5000                          // Number of milliseconds pv voltage needs to be above threshold switch on
+#define SWITCH_ON_TIME 5000                            // Number of milliseconds pv voltage needs to be above threshold switch on
 #define SWITCH_OFF_TIME 5000                           // Number of milliseconds pv voltage needs to be under threshold to switch off
+#define MIN_POWER_WAIT_TIME 12000                      // Number of 10 ms ticks to wait if converter does not produce the minimum power
+#define SCAN_WAIT_TIME 2000                            // Time to wait before starting scan after setting pwm to 0
 
 #define SWITCH_ON_MILLIVOLTS 7500                      // Threshold to switch converter on from sleep mode
 
@@ -72,11 +74,13 @@
 
 
 enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE_EXIT=2, CMD_CALIB_EXIT=3, 
-CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
-CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
-CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
-CMD_RETURN_CONV_INFO=12};
-enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, CALIB_BV_START, CALIB_BV_WAIT};
+  CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
+  CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
+  CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
+  CMD_RETURN_CONV_INFO=12, CMD_RESET_ENERGY = 13, CMD_RESET_CHARGE = 14, 
+  CMD_RESET_DISCHARGE = 15};
+enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, 
+  CALIB_BV_START, CALIB_BV_WAIT};
 enum {LEDC_OFF = 0, LEDC_ON, LED_FLASH_FAST};
 enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF};
 
@@ -105,9 +109,25 @@ typedef struct {
   uint32_t conv_power_mw;
   uint32_t load_power_mw;
   uint32_t batt_power_mw;
+  uint64_t conv_energy;
+  uint64_t battery_charge;
+  uint64_t battery_discharge;
   uint16_t battery_temp;
   uint16_t battery_temp_filt;
+
 } sensor_values_t;
+
+typedef struct {
+  uint16_t pv_mv;
+  uint16_t batt_mv;
+  uint16_t conv_ma;
+  uint16_t load_ma;
+  uint16_t battery_temp_k;
+  uint16_t conv_energy_mwh;
+  uint16_t batt_charge_mah;
+  uint16_t batt_discharge_mah;
+} sensor_info_t;
+
 
 // A place to store converter variables
 
@@ -501,6 +521,15 @@ void update_values(void)
 
   sensor_values.batt_power_mw = (batt_ma_abs * sensor_values.batt_mv_filt)/1000;
   
+  // Integrate power to get energy
+  sensor_values.conv_energy += sensor_values.conv_power_mw;
+  
+  // Integrate battery milliamps to get maH
+  if(sensor_values.batt_ma_filt < 0)
+    sensor_values.battery_discharge += batt_ma_abs;
+  else
+    sensor_values.battery_charge += batt_ma_abs;
+  
   digitalWrite(PROFILEPIN, false);
  
 }
@@ -586,8 +615,13 @@ void do_calib(void)
 */
 
 
-enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, CONVSTATE_SCAN_START, CONVSTATE_SCAN, CONVSTATE_VOLTAGE_DIP, 
-CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB, CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, CONVSTATE_FLOAT_EXIT};
+enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, 
+    CONVSTATE_SCAN_START, CONVSTATE_SCAN_WAIT, CONVSTATE_SCAN, 
+    CONVSTATE_MIN_POWER_WAIT, 
+    CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB,
+    CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, 
+    CONVSTATE_FLOAT_EXIT
+};
 
 enum {SRVCS_START = 0, SRVCS_UNDERVOLT, SRVCS_OVERVOLT};
 
@@ -604,7 +638,6 @@ void converter_ctrl_loop(void)
   converter.gassing_mv = BATTERY_GASSING_MILLIVOLTS + converter.tempoffset;
   converter.float_hold_mv = FLOAT_HOLD_MV + converter.tempoffset;
   
-
   switch(converter.state)
   {
     case CONVSTATE_INIT:
@@ -640,20 +673,20 @@ void converter_ctrl_loop(void)
       break;
       
     case CONVSTATE_SCAN_START:
-      converter_pwm_set(converter.pwm_max_power = converter.max_power = 0);
+      converter_pwm_set(0);
+      converter.pwm_max_power = 0;
+      converter.max_power = 0;
       timer.scan = 0;
-      converter.state = CONVSTATE_SCAN;
+      set_timer(&timer.charge, SCAN_WAIT_TIME);
+      converter.state = CONVSTATE_SCAN_WAIT;
       break;
       
-    
+    case CONVSTATE_SCAN_WAIT:
+      if(!read_timer(&timer.charge))
+        converter.state = CONVSTATE_SCAN;
+      break;
+      
     case CONVSTATE_SCAN:
-      if(sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV){
-         // If voltage dips under switch on threshold, go back to sleep for a time period.
-         set_timer(&timer.charge, SWITCH_OFF_TIME);
-         converter_pwm_set(0);
-         converter.state = CONVSTATE_VOLTAGE_DIP;
-      }
-      else{
         if(!timer.scan){
           if(sensor_values.conv_power_mw > converter.max_power){
             // We noted an increase in power
@@ -663,14 +696,19 @@ void converter_ctrl_loop(void)
           // Increase PWM duty cycle by one count, but  
           // cut scan short if gassing voltage is reached.
           if((converter_pwm_set(converter.pwm + 1)) ||
-            sensor_values.batt_mv_filt > converter.gassing_mv ){
+            (sensor_values.batt_mv_filt > converter.gassing_mv) ){
+            //debug(0,"Clip: %u %u", converter.pwm, converter.pwm_max_power);
             // At max duty cycle, stop the scan
             // Ensure it is over the minimum power
             if(converter.max_power < MIN_CONV_POWER){
-              converter.state = CONVSTATE_OFF;
+              // Wait a prescribed amount of time before doing another scan
+              converter_pwm_set(0);
+              set_timer(&timer.charge10, MIN_POWER_WAIT_TIME);
+              converter.state = CONVSTATE_MIN_POWER_WAIT;
               break;
             }
             else{
+              converter_pwm_set(converter.pwm_max_power);
               converter.state = CONVSTATE_BULK;
               set_timer(&timer.charge10, BULK_RESCAN_TIME);
             }
@@ -678,16 +716,15 @@ void converter_ctrl_loop(void)
           }
           timer.scan = 20;
         }    
-      }
-        
+   
       break;
       
-    case CONVSTATE_VOLTAGE_DIP:
-      if(!read_timer(&timer.charge)){
-        // Timer expired, turn converter off and wait
+    case CONVSTATE_MIN_POWER_WAIT:
+      // Wait before starting another scan
+      if(!read_timer(&timer.charge10))
         converter.state = CONVSTATE_OFF;
-        break;
-      }
+      break;
+      
       if(sensor_values.pv_mv_filt >= SWITCH_ON_MILLIVOLTS + SLEEP_HYST_MV){
         // PV voltage rose back above the theshold. Redo the scan.
         set_timer(&timer.charge, 0);
@@ -856,6 +893,7 @@ void loop()
 {
   static uint8_t ticks;
   uint16_t *values;
+  sensor_info_t *si;
   
   if(i2c.cmd_received){ // Process command
     i2c.cmd_received = false;
@@ -867,37 +905,42 @@ void loop()
       default:
         i2c.tx.length = 0;
         break;
-      // Enter calibration
+    
       case CMD_CALIB_ENTER:
+        // Enter calibration
         converter.state = CONVSTATE_INIT;
         digitalWrite(LOADENAPIN, false);
         converter_pwm_set(0);
         analogWrite(PWMPIN, converter.pwm);
         converter.calibrate = true;
         break;
-      // Start PV voltage calibration  
+      
       case CMD_CALIB_PV_VOLTS:
+        // Start PV voltage calibration  
 	      if(converter.calibrate && (CALIB_IDLE == calib.state)){
            calib.state = CALIB_PVV_START;
         }
         break;
 	   
-      // Start Battery voltage calibration
+      
       case CMD_CALIB_BATT_VOLTS:
+        // Start Battery voltage calibration
 	      if(converter.calibrate && (CALIB_IDLE == calib.state)){
            calib.state = CALIB_BV_START;
         }
         break;  
        
-      // Return calibration state
+      
       case CMD_CALIB_RETURN_STATE:
+        // Return calibration state
         i2c.tx.buffer[0] = calib.state;
         i2c.tx.length = 1;
         digitalWrite(DATA_READY, true);
         break;
       
-      // Return calibration values
+      
       case CMD_CALIB_RETURN_VALUES:
+        // Return calibration values
         values = (uint16_t *) i2c.tx.buffer;
         i2c.tx.length = 4;
         values[0] = eeprom_calib.pv_mv;
@@ -905,52 +948,78 @@ void loop()
         digitalWrite(DATA_READY, true); 
         break;
         
-      // Write calibration to EEPROM and exit
+      
       case CMD_CALIB_WRITE_EXIT:
+        // Write calibration to EEPROM and exit
         eeprom_calib.sig = EEPROM_CALIB_SIG;
         eeprom_write(&eeprom_calib, EEPROM_CALIB_ADDR, sizeof(eeprom_calib));
         converter.calibrate = false;
         break;        
       
-      // Exit Calibration
+     
       case CMD_CALIB_EXIT:
+         // Exit Calibration
         converter.calibrate = false;
         break;
         
-      // Enable switched load  
+      
       case CMD_LOAD_ENABLE:
+        // Enable switched load  
         digitalWrite(LOADEN, true);
         break;
         
-      // Disable switched load  
+     
       case CMD_LOAD_DISABLE:
+         // Disable switched load  
         digitalWrite(LOADEN, false);
         break;
       
-      // Return sensor values  
+     
       case CMD_RETURN_SENSOR_VALUES:
-        values = (uint16_t *) i2c.tx.buffer;
-        i2c.tx.length = 10;
-        values[0] = (uint16_t) sensor_values.pv_mv_filt;
-        values[1] = (uint16_t) sensor_values.batt_mv_filt;
-        values[2] = (uint16_t) sensor_values.conv_ma_filt;
-        values[3] = (uint16_t) sensor_values.load_ma_filt;
-        values[4] = (uint16_t) sensor_values.battery_temp;
+        // Return sensor values  
+        si = (sensor_info_t *) i2c.tx.buffer;
+        i2c.tx.length = sizeof(sensor_info_t);
+        si->pv_mv = (uint16_t) sensor_values.pv_mv_filt;
+        si->batt_mv = (uint16_t) sensor_values.batt_mv_filt;
+        si->conv_ma = (uint16_t) sensor_values.conv_ma_filt;
+        si->load_ma = (uint16_t) sensor_values.load_ma_filt;
+        si->battery_temp_k = (uint16_t) sensor_values.battery_temp;
+        si->conv_energy_mwh = (uint16_t) ((sensor_values.conv_energy / ((uint64_t)3600 * 100)));
+        si->batt_charge_mah = (uint16_t) ((sensor_values.battery_charge / ((uint64_t)3600 * 100)));
+        si->batt_discharge_mah = (uint16_t) ((sensor_values.battery_discharge / ((uint64_t)3600 * 100)));
         digitalWrite(DATA_READY, true);
         break;
         
-      // Return charge mode
+      
       case CMD_RETURN_CHARGE_MODE:
+        // Return charge mode
         i2c.tx.length = 1;
         i2c.tx.buffer[0] = converter.state;
         digitalWrite(DATA_READY, true);
         break;
         
       case CMD_RETURN_CONV_INFO:
+        // Return converter state, thresholds and other info
         i2c.tx.length = sizeof(converter);
         memcpy(i2c.tx.buffer, &converter, sizeof(converter));
         digitalWrite(DATA_READY, true);
         break;
+        
+      case CMD_RESET_ENERGY:
+        // Reset energy integrator
+        sensor_values.conv_energy = 0;
+        break;
+       
+      case CMD_RESET_CHARGE:
+        // Reset charge integrator
+        sensor_values.battery_charge = 0;
+        break;
+        
+      case CMD_RESET_DISCHARGE:
+        // Reset discharge integrator
+        sensor_values.battery_discharge = 0;
+        break;
+      
     }
   }
   
@@ -994,6 +1063,8 @@ void loop()
     //debug(0, "Converter pwm %u", converter.pwm);
     //debug(0, "Converter temperature offset %u", converter.tempoffset);
     //debug(0, "Charge timer: %u", read_timer(&timer.charge));
+    //debug(0, "Converter Energy (mWh): %u", (uint32_t) ((sensor_values.conv_energy/((uint64_t)3600*100))));
+    //debug(0, "Battery Charge (mAh): %u", (uint32_t) ((sensor_values.battery_charge/((uint64_t)3600*100))));
     //debug(0,"\r\n");
     
   }
