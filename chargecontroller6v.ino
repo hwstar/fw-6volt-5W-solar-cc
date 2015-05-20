@@ -10,15 +10,21 @@
 
 #define TWI_ADDRESS 0x08    // I2C address
 
+/*
+* Pin definitions
+*/
 
-// Pin definitions
-
+// Analog / I2C
 #define BVSENSEPIN 0
 #define PVSENSEPIN 1
 #define BISENSEPIN 2
 #define LISENSEPIN 3
-#define I2C_CLOCK 5
 #define I2C_DATA 4
+#define I2C_CLOCK 5
+#define TSENSEPIN 6
+
+// Digital
+
 #define DATA_READY 8
 #define LOADEN 9
 #define PROFILEPIN 10
@@ -26,7 +32,9 @@
 #define LOADENAPIN 12
 #define LEDPIN 13
 
-// Battery constants
+/*
+* Constants
+*/
 
 #define CELLS 3
 #define BATTERY_DISCHARGED_MILLIVOLTS CELLS * 1800     // Battery completely discharged
@@ -40,7 +48,7 @@
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
 
-#define BULK_RESCAN_TIME 30000                         // Time between rescans (10 ms ticks)
+#define BULK_RESCAN_TIME 3000                          // Time between rescans (10 ms ticks)
 #define BULK_POWER_DIP_TIME 5000                       // Time to wait to validate a power dip in bulk charging mode
 #define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
@@ -92,6 +100,7 @@ typedef struct {
   volatile uint8_t scan;
   volatile uint16_t charge;
   volatile uint16_t charge10;
+  volatile uint16_t fgload;
 } timer_t;
 
 // A place to store inputs and filtered versions of inputs
@@ -143,6 +152,8 @@ typedef struct {
   uint16_t end_absorb_mv;
   uint16_t gassing_mv;
   uint16_t float_hold_mv;
+  uint16_t max_power_mv;
+  uint16_t fgload;
   
 } converter_t;
 
@@ -185,11 +196,13 @@ typedef struct {
   uint8_t timer;
 } led_t;
 
+
+
+
+
 /*
 * Variable definitions
 */
-
-
 
 static timer_t timer;
 static sensor_values_t sensor_values;
@@ -215,6 +228,8 @@ void isr_timer1()
     
   if(timer.scan)
     timer.scan--;
+    
+  timer.fgload++;
   
   switch(led.state){
       case LEDS_OFF:
@@ -384,6 +399,26 @@ uint32_t read_milliamps(uint8_t analogpin, uint16_t icalib)
     return ((((uint32_t)analogRead(analogpin)) * icalib)/4096);
 }
 
+/*
+ * Read temperature in Kelvin
+ */
+
+uint8_t read_tempk(uint8_t analogpin, uint16_t tcalib, uint16_t *result)
+{
+
+  uint32_t kvolts;
+  
+  if(!result)
+    return false;
+  
+  kvolts = read_millivolts(analogpin, tcalib, 1);
+  if((kvolts < 2000)||(kvolts > 3730))
+    return false;
+  *result =  (uint16_t) kvolts/10;
+  return true;
+}
+  
+
 
 /*
 * Read timer and return its value
@@ -397,7 +432,6 @@ uint16_t read_timer(volatile uint16_t *ptimer)
   interrupts(); 
   return res;
 }
-
 
 /*
 * Set timer
@@ -461,8 +495,6 @@ void setup()
      eeprom_calib.batt_mv = 5077; 
   }
  
- 
-  
   // Initialize 1 mSec interrupt source
   Timer1.initialize(1000);
   Timer1.attachInterrupt(isr_timer1);
@@ -482,7 +514,6 @@ void setup()
 
 void update_values(void)
 {
-  
   digitalWrite(PROFILEPIN, true);
   
   // Get raw sensor values
@@ -491,7 +522,8 @@ void update_values(void)
   sensor_values.pv_mv = read_millivolts(PVSENSEPIN, eeprom_calib.pv_mv, 3);
   sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE);
   
-  sensor_values.battery_temp = ROOM_TEMP_K;    //  FIXME: Hardcode  battery temp
+  if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
+     sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range.
  
 
   // Filter sensor values
@@ -500,7 +532,6 @@ void update_values(void)
   sensor_values.pv_mv_filt = ((sensor_values.pv_mv_filt * 15) + sensor_values.pv_mv) >> 4;
   sensor_values.load_ma_filt = ((sensor_values.load_ma_filt * 15) + sensor_values.load_ma) >> 4; 
   sensor_values.battery_temp_filt = ((sensor_values.battery_temp_filt * 15) + sensor_values.battery_temp) >> 4; 
-  
   
  
   
@@ -690,8 +721,10 @@ void converter_ctrl_loop(void)
         if(!timer.scan){
           if(sensor_values.conv_power_mw > converter.max_power){
             // We noted an increase in power
+            // Save pwm power, and voltage observed
             converter.max_power = sensor_values.conv_power_mw;
             converter.pwm_max_power = converter.pwm;
+            converter.max_power_mv = sensor_values.pv_mv_filt;
           }
           // Increase PWM duty cycle by one count, but  
           // cut scan short if gassing voltage is reached.
@@ -700,7 +733,7 @@ void converter_ctrl_loop(void)
             //debug(0,"Clip: %u %u", converter.pwm, converter.pwm_max_power);
             // At max duty cycle, stop the scan
             // Ensure it is over the minimum power
-            if(converter.max_power < MIN_CONV_POWER){
+            if(converter.pwm_max_power < MIN_CONV_POWER){
               // Wait a prescribed amount of time before doing another scan
               converter_pwm_set(0);
               set_timer(&timer.charge10, MIN_POWER_WAIT_TIME);
@@ -735,15 +768,23 @@ void converter_ctrl_loop(void)
       
     case CONVSTATE_BULK:
     case CONVSTATE_BULK_POWER_DIP:
+      // See if the scan timer expired
       if(!read_timer(&timer.charge10)){
-        converter.state = CONVSTATE_SCAN_START;
+        // Check to see if the pv mv value at the scan is gtr or less
+        // than the current value by  5%. If it is, do a rescan.
+        uint16_t delta_mv = (converter.max_power_mv >= sensor_values.pv_mv_filt)?
+          converter.max_power_mv - sensor_values.pv_mv_filt :
+          sensor_values.pv_mv_filt - converter.max_power_mv;
+          if(converter.max_power_mv / delta_mv <= 20)
+            converter.state = CONVSTATE_SCAN_START;
+          else
+              set_timer(&timer.charge10, BULK_RESCAN_TIME);
         break;
       }
 
       if(CONVSTATE_BULK == converter.state){
-        // If power dips below 90% of the scan value, or the pv voltage dips start a timer
-        if((sensor_values.conv_power_mw < (converter.pwm_max_power * 9)/10) || 
-        (sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV)){
+        // If the pv voltage dips start a timer
+        if((sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV)){
           set_timer(&timer.charge, BULK_POWER_DIP_TIME);
           converter.state = CONVSTATE_BULK_POWER_DIP;
         }
@@ -1029,6 +1070,9 @@ void loop()
     
   // 10 milliseconds has elapsed. Time to acquire inputs and do calulations.
   
+  set_timer(&timer.fgload, 0);
+ 
+  
   timer.acquire = false;  
   
   // Everything below here runs every 10 mSec.
@@ -1044,8 +1088,10 @@ void loop()
   }
  
   if(ticks++ >= 99){
-    // This is a debug aid. It prints out variables every second.
+  
     ticks = 0;
+    
+    // This is a debug aid. It prints out variables every second.
     //debug(0, "Battery Millivolts raw %u", sensor_values.batt_mv);
     //debug(0, "Battery Millivolts filtered %u", sensor_values.batt_mv_filt);
     //debug(0, "PV Millivolts raw %u", sensor_values.pv_mv);
@@ -1068,4 +1114,7 @@ void loop()
     //debug(0,"\r\n");
     
   }
+  //delay(2);
+  converter.fgload = read_timer(&timer.fgload);
+  
 }
