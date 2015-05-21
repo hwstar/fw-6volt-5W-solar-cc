@@ -1,6 +1,59 @@
 
 /*
-* Solar charge controller for 6 volt lead acid batteries
+* Arduino Solar charge controller for 6 volt lead acid batteries.
+* 
+* This is the firmware to control my 6V solar charge controller
+* The charge controller firmware monitors the pv voltage, converter
+* current, load current, and battery voltage and adjusts the PWM 
+* output to keep the battery charging power at an optimum level
+* depending on the terminal voltage of the battery.
+* 
+* The buck converter in the charger hardware works in both continuous
+* and discontinuous mode. Continuous mode is used at higher charge
+* currents and discontinuous mode is used when charge currents are low.
+* 
+* The charger has 3 stages. BULK, ABSORB and FLOAT. The voltage 
+* thresholds which control transiton to each mode are adjusted based
+* on temperature. A single LM335 temperature sensor provides battery
+* temperature input to the control algorithm.
+* 
+* The BULK charge state tries to dump as much energy into the battery 
+* as possible. The battery terminal voltage is monitored and when it 
+* reaches the programmed threshold. The PV voltage is also monitored 
+* every 30 seconds and if it deviates 5 % from the last voltage noted
+* at maximum power, a scan will be done to determine the the point where
+* the solar panel is delivering maximum power. 
+* 
+* The ABSORB charge state charges the battery at 1/10C to the gassing
+* voltage. Once this voltage is reached, the charger changes to the FLOAT
+* state. 
+* 
+* The FLOAT state keeps the battery terminal voltage at a low voltage
+* to prevent battery gassing. If load currents get too high, the charger
+* will transition out of this state into ABSORB or BULK depending on the
+* current demand from the load.
+* 
+* When a minimum power conversion threshold is reached or the PV voltage
+* drops below what is required for useable energy harvesting, the 
+* charger will go to sleep. In this state, the charger will monitor the
+* PV voltage periodically and make a decision to wake up or not.
+* 
+* There are several I2C commands to get data from the charger, perform
+* calibration, and enable some loads to be switched on and off.
+* 
+* A calibration procedure should be performed after firmware is loaded
+* to null out the tolerances of the  voltage sense resistors. See the
+* I2C commands for details. Calibration values are stored in EEPROM
+* so this procedure only needs to be done once. A semi-precision 6 volt
+* source should be used to power the board during the calibration procedure.
+* One can make such a source using an LM317 and a 3 1/2 digit DMM which
+* is good enough to get a successful calibration result.
+* 
+* This code was tested on an Arduino mini pro 328. With suitable
+* modifications, it should run on any 5 volt Arduino, but make sure
+* the Arduino you are using has a voltage regulator rated for 1% load
+* regulation so that the analog sense voltages will be accurate. Arduinos
+* using the MIC5205 5V regulator are preferred.
 */
 
 #include <EEPROM.h>
@@ -43,8 +96,8 @@
 #define FLOAT_HOLD_MV CELLS * 2280                     // Float holding voltage 293K
 #define BATTERY_GASSING_MILLIVOLTS CELLS * 2415        // Gassing at 293K mv
 
-#define MIN_CONV_POWER 100                             // Need to see this minimum power to go into bulk mode from scan
-#define ABSORB_TARGET_CURRENT 450                      // Target current in absorb mode
+#define MIN_CONV_POWER 10                              // Need to see this minimum power to go into bulk mode from scan
+#define ABSORB_TARGET_CURRENT 450                      // Target current in absorb mode (Tailor to battery C/10).
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
 
@@ -80,16 +133,22 @@
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
 
-
+// Supported I2C commands
 enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE_EXIT=2, CMD_CALIB_EXIT=3, 
   CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
   CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
   CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
   CMD_RETURN_CONV_INFO=12, CMD_RESET_ENERGY = 13, CMD_RESET_CHARGE = 14, 
   CMD_RESET_DISCHARGE = 15};
+  
+// Calibration states
 enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, 
   CALIB_BV_START, CALIB_BV_WAIT};
+  
+// LED commands
 enum {LEDC_OFF = 0, LEDC_ON, LED_FLASH_FAST};
+
+// LED states
 enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF};
 
 // Used by timer interrupt
@@ -164,7 +223,8 @@ typedef struct {
 } calib_t;
 
   
-/* Buffer type */
+//Buffer type 
+
 typedef struct {
   uint8_t command;
   uint8_t length;
@@ -172,7 +232,7 @@ typedef struct {
 } i2c_buffer_t;
 
 
-/* I2C variables */
+//I2C variables
 
 typedef struct {
   volatile uint8_t cmd_received;
@@ -182,7 +242,8 @@ typedef struct {
 } i2c_t;
 
 
-/* EEPROM calibration layout */
+// EEPROM calibration layout
+
 typedef struct {
   uint16_t sig;
   uint16_t batt_mv;
@@ -190,7 +251,8 @@ typedef struct {
 } eeprom_calib_t;
 
 
-/* LED variables */
+//LED variables 
+
 typedef struct {
   uint8_t state;
   uint8_t timer;
@@ -487,7 +549,7 @@ void setup()
   Wire.onRequest(i2c_transmit);
   
   
-  // TODO: Fetch these from NVRAM
+  // Read Calibration constants from NVRAM
   eeprom_read(&eeprom_calib, EEPROM_CALIB_ADDR, sizeof(eeprom_calib));
   if(EEPROM_CALIB_SIG != eeprom_calib.sig){
 	 debug(0, "\r\nInvalid calibration signature\r\n");
@@ -502,14 +564,11 @@ void setup()
   // Set the pwm frequency
   setPwmFrequency(PWMPIN, 1);
 
-  //calib.state = CALIB_BV_START; // DEBUG
-  //converter.calibrate = true; // DEBUG
-  
-  
 }
 
 /*
-* Read sensors and perform filtering
+* Read sensors and perform filtering. 
+* Called from main loop.
 */
 
 void update_values(void)
@@ -523,7 +582,7 @@ void update_values(void)
   sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE);
   
   if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
-     sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range.
+     sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range. Use room temp.
  
 
   // Filter sensor values
@@ -534,10 +593,8 @@ void update_values(void)
   sensor_values.battery_temp_filt = ((sensor_values.battery_temp_filt * 15) + sensor_values.battery_temp) >> 4; 
   
  
-  
   // Derive battery milliamps
   sensor_values.batt_ma_filt = sensor_values.conv_ma_filt - sensor_values.load_ma_filt;
-  
   
   // Calculate converter power in milliwatts
   sensor_values.conv_power_mw = (sensor_values.conv_ma_filt * sensor_values.batt_mv_filt)/1000;
@@ -566,7 +623,7 @@ void update_values(void)
 }
 
 /* 
-* Calibration code
+* Calibration state machine
 */
 
 
@@ -642,9 +699,10 @@ void do_calib(void)
 
 
 /*
-* Converter control loop
+* Converter control state machine
 */
 
+// Converter states
 
 enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, 
     CONVSTATE_SCAN_START, CONVSTATE_SCAN_WAIT, CONVSTATE_SCAN, 
@@ -654,7 +712,12 @@ enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP,
     CONVSTATE_FLOAT_EXIT
 };
 
+// Current control states
+
 enum {SRVCS_START = 0, SRVCS_UNDERVOLT, SRVCS_OVERVOLT};
+
+
+// State machine code. Called from main loop
 
 void converter_ctrl_loop(void)
 {
@@ -730,7 +793,6 @@ void converter_ctrl_loop(void)
           // cut scan short if gassing voltage is reached.
           if((converter_pwm_set(converter.pwm + 1)) ||
             (sensor_values.batt_mv_filt > converter.gassing_mv) ){
-            //debug(0,"Clip: %u %u", converter.pwm, converter.pwm_max_power);
             // At max duty cycle, stop the scan
             // Ensure it is over the minimum power
             if(converter.pwm_max_power < MIN_CONV_POWER){
