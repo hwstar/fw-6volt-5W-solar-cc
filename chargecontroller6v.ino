@@ -668,7 +668,7 @@ void do_calib(void)
     case CALIB_BV_START:
        // Calibrate battery voltage
        led.state = LEDS_FF_ON;
-       eeprom_calib.pv_mv = ANALOG_FULL_SCALE;
+       eeprom_calib.batt_mv = ANALOG_FULL_SCALE;
        set_timer(&timer.charge, CALIB_DWELL_TIME);
        calib.state = CALIB_BV_WAIT;
        break;  

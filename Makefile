@@ -11,6 +11,6 @@ burn:
 	-killall gtkterm
 	sleep 1
 	make upload
-	gtkterm -c arduino &
+	gtkterm -c arduino -p $(ARDUINO_PORT) -s 9600 &
 
 
