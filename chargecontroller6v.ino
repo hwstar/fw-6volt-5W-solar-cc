@@ -13,7 +13,7 @@
 * currents and discontinuous mode is used when charge currents are low.
 * 
 * The charger has 3 stages. BULK, ABSORB and FLOAT. The voltage 
-* thresholds which control transiton to each mode are adjusted based
+* thresholds which control transition to each mode are adjusted based
 * on temperature. A single LM335 temperature sensor provides battery
 * temperature input to the control algorithm.
 * 
@@ -79,7 +79,6 @@
 // Digital
 
 #define DATA_READY 8
-#define LOADEN 9
 #define PROFILEPIN 10
 #define PWMPIN 11
 #define LOADENAPIN 12
@@ -131,6 +130,9 @@
 #define CAL_UPPER_LIMIT 5200                           // Upper cal limit
 #define CAL_LOWER_LIMIT 4800                           // Lower cal limit
 
+#define EEPROM_CONFIG_ADDR 0x00                        // Offset into EEPROM for configuration data
+#define EEPROM_CONFIG_SIG 0x55AA                       // Config signature
+
 #define LED_FAST_BLINK 12                              // 240 ms blink period
 
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
@@ -142,7 +144,7 @@ enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE=2, CMD_CALIB_EXIT=3,
   CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
   CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
   CMD_RETURN_CONV_INFO=12, CMD_RESET_ENERGY = 13, CMD_RESET_CHARGE = 14, 
-  CMD_RESET_DISCHARGE = 15};
+  CMD_RESET_DISCHARGE = 15, CMD_GET_LOAD_ENABLE_STATE = 16};
   
 // Calibration states
 enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, 
@@ -199,8 +201,14 @@ typedef struct {
   uint16_t batt_discharge_mah;
 } sensor_info_t;
 
+// A place to store private converter variables
 
-// A place to store converter variables
+typedef struct {
+  uint8_t placeholder;
+} converter_private_t;
+
+
+// A place to store public converter variables
 
 typedef struct {
   uint8_t state;
@@ -208,6 +216,7 @@ typedef struct {
   uint8_t pwm;
   uint8_t pwm_max_power;
   uint8_t calibrate;
+  uint8_t system_load_enabled;
   uint32_t max_power;
   int16_t tempoffset;
   uint16_t end_bulk_mv;
@@ -216,7 +225,6 @@ typedef struct {
   uint16_t float_hold_mv;
   uint16_t max_power_mv;
   uint16_t fgload;
-  
 } converter_t;
 
 typedef struct {
@@ -254,6 +262,13 @@ typedef struct {
 } eeprom_calib_t;
 
 
+// EEPROM configuration layout
+
+typedef struct {
+  uint16_t sig;
+  uint8_t i2c_load_enabled;
+} eeprom_config_t;
+  
 //LED variables 
 
 typedef struct {
@@ -271,10 +286,12 @@ typedef struct {
 
 static timer_t timer;
 static sensor_values_t sensor_values;
+static converter_private_t converter_private;
 static converter_t converter;
 static i2c_t i2c;
 static calib_t calib;
-static eeprom_calib_t eeprom_calib;  
+static eeprom_calib_t eeprom_calib;
+static eeprom_config_t eeprom_config;  
 static led_t led;
 static uint8_t debug_level = 5;
 
@@ -551,11 +568,21 @@ void setup()
   Wire.onReceive(i2c_receive);
   Wire.onRequest(i2c_transmit);
   
+  // Read config from EEPROM
+  eeprom_read(&eeprom_config, EEPROM_CONFIG_ADDR, sizeof(eeprom_config));
+  if(EEPROM_CONFIG_SIG != eeprom_config.sig){
+     // Bad signature, write default config data to EEPROM
+     debug(0, "\r\nInvalid calibration signature\r\n");
+     eeprom_config.sig = EEPROM_CONFIG_SIG;
+     eeprom_config.i2c_load_enabled = false;
+     eeprom_write(&eeprom_config, EEPROM_CONFIG_ADDR, sizeof(eeprom_config));
+  }
   
-  // Read Calibration constants from NVRAM
+  
+  // Read Calibration constants from EEPROM
   eeprom_read(&eeprom_calib, EEPROM_CALIB_ADDR, sizeof(eeprom_calib));
   if(EEPROM_CALIB_SIG != eeprom_calib.sig){
-	 debug(0, "\r\nInvalid calibration signature\r\n");
+     debug(0, "\r\nInvalid calibration signature\r\n");
      eeprom_calib.pv_mv = 5046; // Bad signature, install appx. values
      eeprom_calib.batt_mv = 5077; 
   }
@@ -777,7 +804,7 @@ void converter_ctrl_loop(void)
       
     case CONVSTATE_OFF:
       converter_pwm_set(0);
-      digitalWrite(LOADENAPIN, true); // Enable load
+      converter.system_load_enabled = true; // Enable load
       converter.state = CONVSTATE_SLEEP;
       break;
     
@@ -1033,6 +1060,13 @@ void loop()
   uint16_t *values;
   sensor_info_t *si;
   
+  // Update load enabled state
+  digitalWrite(LOADENAPIN, eeprom_config.i2c_load_enabled && 
+  converter.system_load_enabled && 
+  !converter.calibrate);
+  
+  // I2C handler
+  
   if(i2c.cmd_received){ // Process command
     i2c.cmd_received = false;
     // Zero out the request buffer
@@ -1047,7 +1081,6 @@ void loop()
       case CMD_CALIB_ENTER:
         // Enter calibration
         converter.state = CONVSTATE_INIT;
-        digitalWrite(LOADENAPIN, false);
         converter_pwm_set(0);
         analogWrite(PWMPIN, converter.pwm);
         converter.calibrate = true;
@@ -1104,19 +1137,30 @@ void loop()
      
       case CMD_CALIB_EXIT:
          // Exit Calibration
+        calib.pv_mv = calib.batt_mv = 0;
         converter.calibrate = false;
         break;
         
       
       case CMD_LOAD_ENABLE:
         // Enable switched load  
-        digitalWrite(LOADEN, true);
+        eeprom_config.i2c_load_enabled = true;
+        eeprom_write(&eeprom_config, EEPROM_CONFIG_ADDR, sizeof(eeprom_config));
+        break;
+      
+        
+      case CMD_LOAD_DISABLE:
+        // Disable switched load  
+        eeprom_config.i2c_load_enabled = false;
+        eeprom_write(&eeprom_config, EEPROM_CONFIG_ADDR, sizeof(eeprom_config));     
         break;
         
-     
-      case CMD_LOAD_DISABLE:
-         // Disable switched load  
-        digitalWrite(LOADEN, false);
+            
+      case CMD_GET_LOAD_ENABLE_STATE:
+        // Return load enabled state
+        i2c.tx.buffer[0] = eeprom_config.i2c_load_enabled;
+        i2c.tx.length = 1;
+        digitalWrite(DATA_READY, true);
         break;
       
      
