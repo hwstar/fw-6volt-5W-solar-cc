@@ -117,6 +117,7 @@
 #define FLOAT_HYST 50                                  // Voltage hysteresis used during float charging stage
 #define ABSORB_HYST 5                                  // Current hysteresis used in absorb charging state
 
+
 #define CONVERTER_PWM_CLIP 0xF0                        // Clip at current limit
 
 #define ANALOG_FULL_SCALE 5000						             // Full scale voltage of an analog input
@@ -127,6 +128,8 @@
 
 #define EEPROM_CALIB_ADDR 0xE0						             // Offset into EEPROM for calibration data
 #define EEPROM_CALIB_SIG 0x5AA5						             // Calibration signature
+#define CAL_UPPER_LIMIT 5200                           // Upper cal limit
+#define CAL_LOWER_LIMIT 4800                           // Lower cal limit
 
 #define LED_FAST_BLINK 12                              // 240 ms blink period
 
@@ -134,7 +137,7 @@
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
 
 // Supported I2C commands
-enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE_EXIT=2, CMD_CALIB_EXIT=3, 
+enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE=2, CMD_CALIB_EXIT=3, 
   CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
   CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
   CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
@@ -218,8 +221,8 @@ typedef struct {
 
 typedef struct {
   uint8_t state;
-  uint16_t value;
-
+  uint16_t pv_mv;
+  uint16_t batt_mv;
 } calib_t;
 
   
@@ -575,10 +578,13 @@ void update_values(void)
 {
   digitalWrite(PROFILEPIN, true);
   
+  // Use cal values if performing calibration
+  uint16_t batt_mv = (calib.batt_mv) ? calib.batt_mv : eeprom_calib.batt_mv;
+  uint16_t pv_mv = (calib.pv_mv) ? calib.pv_mv : eeprom_calib.pv_mv;
   // Get raw sensor values
-  sensor_values.batt_mv = read_millivolts(BVSENSEPIN, eeprom_calib.batt_mv, 2);
+  sensor_values.batt_mv = read_millivolts(BVSENSEPIN, batt_mv, 2);
   sensor_values.conv_ma = read_milliamps(BISENSEPIN, ANALOG_FULL_SCALE);
-  sensor_values.pv_mv = read_millivolts(PVSENSEPIN, eeprom_calib.pv_mv, 3);
+  sensor_values.pv_mv = read_millivolts(PVSENSEPIN, pv_mv, 3);
   sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE);
   
   if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
@@ -629,6 +635,8 @@ void update_values(void)
 
 void do_calib(void)
 {
+
+  
   switch(calib.state){
      default:
        break;
@@ -640,7 +648,8 @@ void do_calib(void)
      case CALIB_PVV_START:
        // Calibrate PV Voltage
        led.state = LEDS_FF_ON; // Flash LED
-       eeprom_calib.pv_mv = ANALOG_FULL_SCALE;
+       //eeprom_calib.pv_mv = ANALOG_FULL_SCALE;
+       calib.pv_mv = ANALOG_FULL_SCALE;
        set_timer(&timer.charge, CALIB_DWELL_TIME);
        calib.state = CALIB_PVV_WAIT;
        break;
@@ -649,17 +658,29 @@ void do_calib(void)
        if(!read_timer(&timer.charge)){
          uint16_t val = sensor_values.pv_mv_filt;
          if(val > PV_CAL_VOLTAGE + CALIB_V_HYST){
-           eeprom_calib.pv_mv--;
+           calib.pv_mv--;
+           if(calib.pv_mv < CAL_LOWER_LIMIT){
+            led.state = LEDS_OFF;
+            calib.state = CALIB_IDLE;
+            debug(0, "\n Error: PV lower limit reached!");
+            break;
+           }
            set_timer(&timer.charge, CALIB_DWELL_TIME);
      
          }
          else if( val < PV_CAL_VOLTAGE - CALIB_V_HYST){
-           eeprom_calib.pv_mv++;
+           calib.pv_mv++;
+           if(calib.pv_mv > CAL_UPPER_LIMIT){
+            led.state = LEDS_OFF;
+            calib.state = CALIB_IDLE;
+            debug(0, "\n Error: PV upper limit reached!");
+            break;
+           }
            set_timer(&timer.charge, CALIB_DWELL_TIME);
          }
          else{
            led.state = LEDS_OFF;
-           debug(0, "\n*** PV Calibration value = %u ***\n", eeprom_calib.pv_mv);
+           debug(0, "\n*** PV Calibration value = %u ***\n", calib.pv_mv);
            calib.state = CALIB_IDLE;
          }
       }
@@ -668,7 +689,8 @@ void do_calib(void)
     case CALIB_BV_START:
        // Calibrate battery voltage
        led.state = LEDS_FF_ON;
-       eeprom_calib.batt_mv = ANALOG_FULL_SCALE;
+       //eeprom_calib.batt_mv = ANALOG_FULL_SCALE;
+       calib.batt_mv = ANALOG_FULL_SCALE;
        set_timer(&timer.charge, CALIB_DWELL_TIME);
        calib.state = CALIB_BV_WAIT;
        break;  
@@ -677,17 +699,30 @@ void do_calib(void)
        if(!read_timer(&timer.charge)){
          uint16_t val = sensor_values.batt_mv_filt;
          if(val > BATT_CAL_VOLTAGE + 5){
-           eeprom_calib.batt_mv--;
+           calib.batt_mv--;
+           if(calib.batt_mv < CAL_LOWER_LIMIT){
+            led.state = LEDS_OFF;
+            calib.state = CALIB_IDLE;
+            debug(0, "\n Error: BV lower limit reached!");
+            break;
+           }
+
            set_timer(&timer.charge, 200);
      
          }
          else if( val < BATT_CAL_VOLTAGE - 5){
-           eeprom_calib.batt_mv++;
+           calib.batt_mv++;
+           if(calib.batt_mv > CAL_UPPER_LIMIT){
+            led.state = LEDS_OFF;
+            calib.state = CALIB_IDLE;
+            debug(0, "\n Error: BV upper limit reached!");
+            break;
+           }
            set_timer(&timer.charge, 200);
          }
          else{
            led.state = LEDS_OFF;
-           debug(0, "\n*** BV Calibration value = %u ***\n", eeprom_calib.batt_mv);
+           debug(0, "\n*** BV Calibration value = %u ***\n", calib.batt_mv);
            calib.state = CALIB_IDLE;
          }
       }
@@ -1046,17 +1081,24 @@ void loop()
         // Return calibration values
         values = (uint16_t *) i2c.tx.buffer;
         i2c.tx.length = 4;
-        values[0] = eeprom_calib.pv_mv;
-        values[1] = eeprom_calib.batt_mv;
+        values[0] = (calib.pv_mv) ? calib.pv_mv : eeprom_calib.pv_mv;
+        values[1] = (calib.batt_mv) ? calib.batt_mv : eeprom_calib.batt_mv;
         digitalWrite(DATA_READY, true); 
         break;
         
       
-      case CMD_CALIB_WRITE_EXIT:
-        // Write calibration to EEPROM and exit
-        eeprom_calib.sig = EEPROM_CALIB_SIG;
-        eeprom_write(&eeprom_calib, EEPROM_CALIB_ADDR, sizeof(eeprom_calib));
-        converter.calibrate = false;
+      case CMD_CALIB_WRITE:
+        // Write calibration to EEPROM if values within limits
+        if((calib.pv_mv >= CAL_LOWER_LIMIT) &&
+           (calib.pv_mv <= CAL_UPPER_LIMIT) &&
+           (calib.batt_mv >= CAL_LOWER_LIMIT) &&
+           (calib.batt_mv <= CAL_UPPER_LIMIT)){
+          eeprom_calib.sig = EEPROM_CALIB_SIG;
+          eeprom_calib.pv_mv = calib.pv_mv;
+          eeprom_calib.batt_mv = calib.batt_mv;
+          eeprom_write(&eeprom_calib, EEPROM_CALIB_ADDR, sizeof(eeprom_calib));
+          calib.batt_mv = calib.pv_mv = 0;
+        }
         break;        
       
      
