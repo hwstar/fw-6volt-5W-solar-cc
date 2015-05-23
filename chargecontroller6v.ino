@@ -138,13 +138,19 @@
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
 
+#define DESIGNER_ID "HWSTAR"                           // Designer handle
+#define PROJECT_ID "66-000101"                         // 66-000101 printed circuit board
+#define MAJOR_VERSION 0                                // Major version number
+#define MINOR_VERSION 0                                // Minor version number
+
 // Supported I2C commands
 enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE=2, CMD_CALIB_EXIT=3, 
   CMD_CALIB_PV_VOLTS=4, CMD_CALIB_BATT_VOLTS=5, CMD_CALIB_RETURN_STATE=6,
   CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
   CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
   CMD_RETURN_CONV_INFO=12, CMD_RESET_ENERGY = 13, CMD_RESET_CHARGE = 14, 
-  CMD_RESET_DISCHARGE = 15, CMD_GET_LOAD_ENABLE_STATE = 16};
+  CMD_RESET_DISCHARGE = 15, CMD_GET_LOAD_ENABLE_STATE = 16,
+  CMD_GET_ID_INFO = 255};
   
 // Calibration states
 enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT, 
@@ -239,7 +245,7 @@ typedef struct {
 typedef struct {
   uint8_t command;
   uint8_t length;
-  uint8_t buffer[24];
+  uint8_t buffer[32];
 } i2c_buffer_t;
 
 
@@ -276,8 +282,14 @@ typedef struct {
   uint8_t timer;
 } led_t;
 
+// Identification
 
-
+typedef struct {
+  char designer[10];
+  char project[10];
+  uint16_t minor_version;
+  uint16_t major_version;
+} id_t;
 
 
 /*
@@ -286,7 +298,7 @@ typedef struct {
 
 static timer_t timer;
 static sensor_values_t sensor_values;
-static converter_private_t converter_private;
+//static converter_private_t converter_private;
 static converter_t converter;
 static i2c_t i2c;
 static calib_t calib;
@@ -294,6 +306,7 @@ static eeprom_calib_t eeprom_calib;
 static eeprom_config_t eeprom_config;  
 static led_t led;
 static uint8_t debug_level = 5;
+
 
 
 
@@ -1059,6 +1072,7 @@ void loop()
   static uint8_t ticks;
   uint16_t *values;
   sensor_info_t *si;
+  id_t *id;
   
   // Update load enabled state
   digitalWrite(LOADENAPIN, eeprom_config.i2c_load_enabled && 
@@ -1208,7 +1222,20 @@ void loop()
         // Reset discharge integrator
         sensor_values.battery_discharge = 0;
         break;
-      
+        
+      case CMD_GET_ID_INFO:
+        // Return id info
+        i2c.tx.length = sizeof(id_t);
+        id = (id_t *) i2c.tx.buffer;
+        strcpy(id->designer, DESIGNER_ID);
+        strcpy(id->project, PROJECT_ID);
+        id->major_version = MAJOR_VERSION;
+        id->minor_version = MINOR_VERSION;
+        digitalWrite(DATA_READY, true);
+        break;
+        
+        
+  
     }
   }
   
