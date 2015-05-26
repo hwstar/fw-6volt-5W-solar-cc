@@ -111,6 +111,8 @@
 #define SWITCH_OFF_TIME 5000                           // Number of milliseconds pv voltage needs to be under threshold to switch off
 #define MIN_POWER_WAIT_TIME 12000                      // Number of 10 ms ticks to wait if converter does not produce the minimum power
 #define SCAN_WAIT_TIME 2000                            // Time to wait before starting scan after setting pwm to 0
+#define SCAN_TIMER_INCREMENT_FAST 20                   // Time in milliseconds to wait before incrementing pwm value, fast speed
+#define SCAN_TIMER_INCREMENT_SLOW 100                  // Time in milliseconds to wait before incrementing pwm value, slow speed
 
 #define SWITCH_ON_MILLIVOLTS 7500                      // Threshold to switch converter on from sleep mode
 
@@ -170,7 +172,7 @@ enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF};
 typedef struct {
   unsigned acquire : 1;
   volatile uint8_t ticks;
-  volatile uint8_t scan;
+  volatile uint16_t scan;
   volatile uint16_t charge;
   volatile uint16_t charge10;
   volatile uint16_t fgload;
@@ -216,7 +218,7 @@ typedef struct {
 // A place to store private converter variables
 
 typedef struct {
-  uint8_t placeholder;
+  uint8_t slow_scan_stop_pwm;
 } converter_private_t;
 
 
@@ -304,7 +306,7 @@ typedef struct {
 
 static timer_t timer;
 static sensor_values_t sensor_values;
-//static converter_private_t converter_private;
+static converter_private_t converter_private;
 static converter_t converter;
 static i2c_t i2c;
 static calib_t calib;
@@ -634,7 +636,7 @@ void update_values(void)
   sensor_values.conv_ma = read_milliamps(BISENSEPIN, ANALOG_FULL_SCALE, 3994);
   sensor_values.pv_mv = read_millivolts(PVSENSEPIN, pv_mv, 3);
   sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE, 3994);
-  sensor_values.pv_ma = read_milliamps(PISENSEPIN, ANALOG_FULL_SCALE, 4096); // External sensor, testing only!
+  sensor_values.pv_ma = read_milliamps(PISENSEPIN, ANALOG_FULL_SCALE, 3994); // External sensor, testing only!
   
   if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
      sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range. Use room temp.
@@ -790,8 +792,8 @@ void do_calib(void)
 // Converter states
 
 enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP, 
-    CONVSTATE_SCAN_START, CONVSTATE_SCAN_WAIT, CONVSTATE_SCAN, 
-    CONVSTATE_MIN_POWER_WAIT, 
+    CONVSTATE_SCAN_START, CONVSTATE_SCAN_WAIT_FAST, CONVSTATE_SCAN_WAIT_SLOW,
+    CONVSTATE_SCAN_FAST, CONVSTATE_SCAN_SLOW, CONVSTATE_MIN_POWER_WAIT, 
     CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB,
     CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, 
     CONVSTATE_FLOAT_EXIT,CONVSTATE_DISABLED
@@ -806,6 +808,7 @@ enum {SRVCS_START = 0, SRVCS_UNDERVOLT, SRVCS_OVERVOLT};
 
 void converter_ctrl_loop(void)
 {
+  uint8_t stop = false;
   
   converter.tempoffset = (sensor_values.battery_temp - ROOM_TEMP_K) *
   BATTERY_TEMPCO;
@@ -857,18 +860,26 @@ void converter_ctrl_loop(void)
       converter_pwm_set(0);
       converter.pwm_max_power = 0;
       converter.max_power = 0;
-      timer.scan = 0;
+      set_timer(&timer.scan, 0);
       set_timer(&timer.charge, SCAN_WAIT_TIME);
-      converter.state = CONVSTATE_SCAN_WAIT;
+      converter.state = CONVSTATE_SCAN_WAIT_FAST;
       break;
       
-    case CONVSTATE_SCAN_WAIT:
+    case CONVSTATE_SCAN_WAIT_FAST:
       if(!read_timer(&timer.charge))
-        converter.state = CONVSTATE_SCAN;
+        converter.state = CONVSTATE_SCAN_FAST;
       break;
       
-    case CONVSTATE_SCAN:
-        if(!timer.scan){
+    case CONVSTATE_SCAN_WAIT_SLOW:
+      if(!read_timer(&timer.charge)){
+        converter.state = CONVSTATE_SCAN_SLOW;
+      }
+      break;
+    
+      
+    case CONVSTATE_SCAN_FAST:
+    case CONVSTATE_SCAN_SLOW:
+      if(!read_timer(&timer.scan)){
           if(sensor_values.conv_power_mw > converter.max_power){
             // We noted an increase in power
             // Save pwm power, and voltage observed
@@ -877,9 +888,14 @@ void converter_ctrl_loop(void)
             converter.max_power_mv = sensor_values.pv_mv_filt;
           }
           // Increase PWM duty cycle by one count, but  
-          // cut scan short if gassing voltage is reached.
-          if((converter_pwm_set(converter.pwm + 1)) ||
-            (sensor_values.batt_mv_filt > converter.gassing_mv) ){
+          // cut scan short if gassing voltage is reached,
+          // or if in slow scan mode, and stop pwm value is reached
+          stop = converter_pwm_set(converter.pwm + 1);
+          if(CONVSTATE_SCAN_SLOW == converter.state){
+            stop |= (converter.pwm >= converter_private.slow_scan_stop_pwm);
+          }
+          if(stop ||
+            (sensor_values.batt_mv_filt > converter.gassing_mv)){
             // At max duty cycle, stop the scan
             // Ensure it is over the minimum power
             if(converter.pwm_max_power < MIN_CONV_POWER){
@@ -890,15 +906,39 @@ void converter_ctrl_loop(void)
               break;
             }
             else{
-              converter_pwm_set(converter.pwm_max_power);
-              converter.state = CONVSTATE_BULK;
-              set_timer(&timer.charge10, BULK_RESCAN_TIME);
+              if(converter.state == CONVSTATE_SCAN_SLOW){
+                  converter_pwm_set(converter.pwm_max_power);
+                  converter.state = CONVSTATE_BULK;
+                  set_timer(&timer.charge10, BULK_RESCAN_TIME);
+              }
+              else{
+                  uint16_t stop_pwm = 0;
+                  // Start a slower scan at 90 to 110 percent
+                  // of the fast scan peak pwm value
+                  // This ensures an accurate detection of the peak value.
+                  converter_pwm_set((converter.pwm_max_power > 2) ?
+                  ((converter.pwm_max_power * 9)/10) :
+                  0);
+                  stop_pwm = (((uint16_t) converter.pwm_max_power) * 11)/10;
+                  if(stop_pwm > CONVERTER_PWM_CLIP)
+                    stop_pwm = CONVERTER_PWM_CLIP;
+                  converter_private.slow_scan_stop_pwm = 
+                  (uint8_t) stop_pwm;
+
+                  // Reset the other peak vars
+                  converter.pwm_max_power = 0;
+                  converter.max_power = 0;
+                  converter.max_power_mv = 0;
+                  // Wait for voltages to stabilize
+                  set_timer(&timer.charge, SCAN_WAIT_TIME);
+                  converter.state = CONVSTATE_SCAN_WAIT_SLOW;
             }
             break;
           }
-          timer.scan = 20;
-        }    
-   
+        }
+        set_timer(&timer.scan, (converter.state == CONVSTATE_SCAN_FAST) ?
+        SCAN_TIMER_INCREMENT_FAST : SCAN_TIMER_INCREMENT_SLOW);    
+      }
       break;
       
     case CONVSTATE_MIN_POWER_WAIT:
