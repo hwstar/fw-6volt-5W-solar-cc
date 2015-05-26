@@ -75,10 +75,12 @@
 #define I2C_DATA 4
 #define I2C_CLOCK 5
 #define TSENSEPIN 6
+#define PISENSEPIN 7    // Reserved for testing. PV input current (external sensor)
 
 // Digital
 
 #define DATA_READY 8
+#define PVENAPIN 9
 #define PROFILEPIN 10
 #define PWMPIN 11
 #define LOADENAPIN 12
@@ -149,7 +151,8 @@ enum {CMD_NOP=0, CMD_CALIB_ENTER=1, CMD_CALIB_WRITE=2, CMD_CALIB_EXIT=3,
   CMD_CALIB_RETURN_VALUES=7, CMD_LOAD_ENABLE=8, CMD_LOAD_DISABLE=9,
   CMD_RETURN_SENSOR_VALUES=10, CMD_RETURN_CHARGE_MODE=11,
   CMD_RETURN_CONV_INFO=12, CMD_RESET_ENERGY = 13, CMD_RESET_CHARGE = 14, 
-  CMD_RESET_DISCHARGE = 15, CMD_GET_LOAD_ENABLE_STATE = 16,
+  CMD_RESET_DISCHARGE = 15, CMD_GET_LOAD_ENABLE_STATE = 16, 
+  CMD_CONV_ENABLE = 17, CMD_CONV_DISABLE = 18,
   CMD_GET_ID_INFO = 255};
   
 // Calibration states
@@ -184,6 +187,8 @@ typedef struct {
   uint32_t conv_ma_filt;
   uint32_t load_ma;
   uint32_t load_ma_filt;
+  uint32_t pv_ma; // Testing only
+  uint32_t pv_ma_filt; // Testing only
   int32_t batt_ma_filt;
   uint32_t conv_power_mw;
   uint32_t load_power_mw;
@@ -205,6 +210,7 @@ typedef struct {
   uint16_t conv_energy_mwh;
   uint16_t batt_charge_mah;
   uint16_t batt_discharge_mah;
+  uint16_t pv_ma; // Testing only. Requires external sensor
 } sensor_info_t;
 
 // A place to store private converter variables
@@ -489,9 +495,9 @@ uint32_t read_millivolts(uint8_t analogpin, uint16_t vcalib, uint8_t scale)
 * Read analog channel and return value in milliamps
 */
 
-uint32_t read_milliamps(uint8_t analogpin, uint16_t icalib)
+uint32_t read_milliamps(uint8_t analogpin, uint16_t icalib, uint16_t idenom)
 {
-    return ((((uint32_t)analogRead(analogpin)) * icalib)/4096);
+    return ((((uint32_t)analogRead(analogpin)) * icalib)/ idenom);
 }
 
 /*
@@ -574,6 +580,8 @@ void setup()
   digitalWrite(LEDPIN, false);
   pinMode(LOADENAPIN, OUTPUT); // sets the LOAD enable pin as an output
   digitalWrite(LOADENAPIN, false);
+  pinMode(PVENAPIN, OUTPUT); // sets the PV enable pin as output
+  digitalWrite(PVENAPIN, false); 
   pinMode(PROFILEPIN, OUTPUT);   // sets the PROFILE pin as output
   
   // I2C Setup
@@ -623,9 +631,10 @@ void update_values(void)
   uint16_t pv_mv = (calib.pv_mv) ? calib.pv_mv : eeprom_calib.pv_mv;
   // Get raw sensor values
   sensor_values.batt_mv = read_millivolts(BVSENSEPIN, batt_mv, 2);
-  sensor_values.conv_ma = read_milliamps(BISENSEPIN, ANALOG_FULL_SCALE);
+  sensor_values.conv_ma = read_milliamps(BISENSEPIN, ANALOG_FULL_SCALE, 3994);
   sensor_values.pv_mv = read_millivolts(PVSENSEPIN, pv_mv, 3);
-  sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE);
+  sensor_values.load_ma = read_milliamps(LISENSEPIN, ANALOG_FULL_SCALE, 3994);
+  sensor_values.pv_ma = read_milliamps(PISENSEPIN, ANALOG_FULL_SCALE, 4096); // External sensor, testing only!
   
   if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
      sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range. Use room temp.
@@ -636,7 +645,8 @@ void update_values(void)
   sensor_values.conv_ma_filt = ((sensor_values.conv_ma_filt * 15) + sensor_values.conv_ma) >> 4; 
   sensor_values.pv_mv_filt = ((sensor_values.pv_mv_filt * 15) + sensor_values.pv_mv) >> 4;
   sensor_values.load_ma_filt = ((sensor_values.load_ma_filt * 15) + sensor_values.load_ma) >> 4; 
-  sensor_values.battery_temp_filt = ((sensor_values.battery_temp_filt * 15) + sensor_values.battery_temp) >> 4; 
+  sensor_values.battery_temp_filt = ((sensor_values.battery_temp_filt * 15) + sensor_values.battery_temp) >> 4;
+  sensor_values.pv_ma_filt = ((sensor_values.pv_ma_filt * 15) + sensor_values.pv_ma) >> 4; // External sensor, testing only!
   
  
   // Derive battery milliamps
@@ -784,7 +794,7 @@ enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP,
     CONVSTATE_MIN_POWER_WAIT, 
     CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB,
     CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, 
-    CONVSTATE_FLOAT_EXIT
+    CONVSTATE_FLOAT_EXIT,CONVSTATE_DISABLED
 };
 
 // Current control states
@@ -810,10 +820,10 @@ void converter_ctrl_loop(void)
   switch(converter.state)
   {
     case CONVSTATE_INIT:
-      set_timer(&timer.charge, 0);
-      timer.scan = 0;
       converter_pwm_set(0);
       converter.state = CONVSTATE_OFF;
+      break;
+      
       
     case CONVSTATE_OFF:
       converter_pwm_set(0);
@@ -822,6 +832,7 @@ void converter_ctrl_loop(void)
       break;
     
     case CONVSTATE_SLEEP:
+      digitalWrite(PVENAPIN, false);
       if(sensor_values.pv_mv_filt >= SWITCH_ON_MILLIVOLTS + SLEEP_HYST_MV){
         set_timer(&timer.charge, SWITCH_ON_TIME);
         converter.state = CONVSTATE_WAKEUP;
@@ -836,6 +847,7 @@ void converter_ctrl_loop(void)
         break;
       }
       if(!read_timer(&timer.charge)){
+        digitalWrite(PVENAPIN, true);
         converter.state = CONVSTATE_SCAN_START;
         break;
       }
@@ -912,8 +924,9 @@ void converter_ctrl_loop(void)
         uint16_t delta_mv = (converter.max_power_mv >= sensor_values.pv_mv_filt)?
           converter.max_power_mv - sensor_values.pv_mv_filt :
           sensor_values.pv_mv_filt - converter.max_power_mv;
-          if(converter.max_power_mv / delta_mv <= 20)
+          if(converter.max_power_mv / delta_mv <= 20){
             converter.state = CONVSTATE_SCAN_START;
+          }
           else
               set_timer(&timer.charge10, BULK_RESCAN_TIME);
         break;
@@ -928,9 +941,14 @@ void converter_ctrl_loop(void)
       }
       else{
         if(!read_timer(&timer.charge)){
-          // Power consistently below 90% after a time delay. Do a rescan.
-          converter.state = CONVSTATE_SCAN_START;
-          break;
+          if((sensor_values.pv_mv_filt > SWITCH_ON_MILLIVOLTS + SLEEP_HYST_MV)){
+            converter.state = CONVSTATE_BULK;
+          }
+          else{
+            // Power consistently below 90% after a time delay. Do a rescan.
+            converter.state = CONVSTATE_SCAN_START;
+            break;
+          }
         }
       }
  
@@ -954,8 +972,8 @@ void converter_ctrl_loop(void)
         (sensor_values.pv_mv_filt < SWITCH_ON_MILLIVOLTS - SLEEP_HYST_MV)){
         converter.state = CONVSTATE_SCAN_START;
       }  
-    
       break;
+      
      
     case CONVSTATE_ABSORB:
 
@@ -1055,6 +1073,13 @@ void converter_ctrl_loop(void)
         converter_pwm_set(converter.pwm - 1);
       break; 
   
+      case CONVSTATE_DISABLED:
+        // Disable converter and enable load at system level
+        // Used for testing
+        digitalWrite(PVENAPIN, false);
+        converter_pwm_set(0);
+        converter.system_load_enabled = true; // Enable load
+        break;
  
     default:
       break;
@@ -1186,6 +1211,7 @@ void loop()
         si->batt_mv = (uint16_t) sensor_values.batt_mv_filt;
         si->conv_ma = (uint16_t) sensor_values.conv_ma_filt;
         si->load_ma = (uint16_t) sensor_values.load_ma_filt;
+        si->pv_ma = (uint16_t) sensor_values.pv_ma_filt; // Testing only. Requires external sensor
         si->battery_temp_k = (uint16_t) sensor_values.battery_temp;
         si->conv_energy_mwh = (uint16_t) ((sensor_values.conv_energy / ((uint64_t)3600 * 100)));
         si->batt_charge_mah = (uint16_t) ((sensor_values.battery_charge / ((uint64_t)3600 * 100)));
@@ -1234,8 +1260,19 @@ void loop()
         digitalWrite(DATA_READY, true);
         break;
         
+      case CMD_CONV_DISABLE:
+        // Disable converter for testing  
+        converter.state = CONVSTATE_DISABLED;
+        break;
         
-  
+      case CMD_CONV_ENABLE:
+        // Disable converter for testing  
+        // Restarts the converter in the OFF state.
+        // This allows test programs to monitor the state transitions
+        // to the ending charge state. This is a feature, not a bug.
+        converter.state = CONVSTATE_OFF;
+        break;
+
     }
   }
   
