@@ -101,6 +101,7 @@
 #define ABSORB_TARGET_CURRENT 450                      // Target current in absorb mode (Tailor to battery C/10).
 #define BATTERY_TEMPCO CELLS * -2                      // mV per deg. K for battery
 #define ROOM_TEMP_K 293                                // Room temp in Kelvin
+#define SYSTEM_OVERTEMP_LIMIT 338                      // Battery Overtemp cutout
 
 #define BULK_RESCAN_TIME 3000                          // Time between rescans (10 ms ticks)
 #define BULK_POWER_DIP_TIME 5000                       // Time to wait to validate a power dip in bulk charging mode
@@ -138,6 +139,7 @@
 #define EEPROM_CONFIG_SIG 0x55AA                       // Config signature
 
 #define LED_FAST_BLINK 12                              // 240 ms blink period
+#define LED_VERY_FAST_BLINK 7                          // 140 ms blink period
 
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
@@ -165,7 +167,7 @@ enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT,
 enum {LEDC_OFF = 0, LEDC_ON, LED_FLASH_FAST};
 
 // LED states
-enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF};
+enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF, LEDS_FVF_ON, LEDS_FVF_OFF};
 
 // Used by timer interrupt
 
@@ -358,6 +360,22 @@ void isr_timer1()
           led.state = LEDS_FF_OFF;
         }
         break;
+
+     case LEDS_FVF_OFF:
+        if(!led.timer){
+          led.timer = LED_VERY_FAST_BLINK;
+          digitalWrite(LEDPIN, true);
+          led.state = LEDS_FVF_ON;
+        }
+        break;
+      
+      case LEDS_FVF_ON:
+       if(!led.timer){
+          led.timer = LED_VERY_FAST_BLINK;
+          digitalWrite(LEDPIN, false);
+          led.state = LEDS_FVF_OFF;
+        }
+        break;
   }
   
   // Tell foreground to re-acquire sensor values every 10 mSec.
@@ -515,7 +533,7 @@ uint8_t read_tempk(uint8_t analogpin, uint16_t tcalib, uint16_t *result)
     return false;
   
   kvolts = read_millivolts(analogpin, tcalib, 1);
-  if((kvolts < 2000)||(kvolts > 3730))
+  if((kvolts < 1000))
     return false;
   *result =  (uint16_t) kvolts/10;
   return true;
@@ -641,7 +659,6 @@ void update_values(void)
   if(!read_tempk(TSENSEPIN, 5000, &sensor_values.battery_temp))
      sensor_values.battery_temp = ROOM_TEMP_K;    // Sensor out of range. Use room temp.
  
-
   // Filter sensor values
   sensor_values.batt_mv_filt = ((sensor_values.batt_mv_filt * 15) + sensor_values.batt_mv) >> 4;
   sensor_values.conv_ma_filt = ((sensor_values.conv_ma_filt * 15) + sensor_values.conv_ma) >> 4; 
@@ -796,7 +813,7 @@ enum {CONVSTATE_INIT=0, CONVSTATE_OFF, CONVSTATE_SLEEP, CONVSTATE_WAKEUP,
     CONVSTATE_SCAN_FAST, CONVSTATE_SCAN_SLOW, CONVSTATE_MIN_POWER_WAIT, 
     CONVSTATE_BULK, CONVSTATE_BULK_POWER_DIP, CONVSTATE_BULK_ABSORB,
     CONVSTATE_ABSORB, CONVSTATE_ABSORB_FLOAT, CONVSTATE_FLOAT, 
-    CONVSTATE_FLOAT_EXIT,CONVSTATE_DISABLED
+    CONVSTATE_FLOAT_EXIT,CONVSTATE_DISABLED, CONVSTATE_OVERTEMP
 };
 
 // Current control states
@@ -829,6 +846,8 @@ void converter_ctrl_loop(void)
       
       
     case CONVSTATE_OFF:
+    case CONVSTATE_OVERTEMP:
+      led.state = LEDS_OFF;
       converter_pwm_set(0);
       converter.system_load_enabled = true; // Enable load
       converter.state = CONVSTATE_SLEEP;
@@ -1331,17 +1350,33 @@ void loop()
  
   update_values(); // Get the inputs and average them
   
+
   if(converter.calibrate){
     // Do calibration instead of control
     do_calib();
   }
   else{
-    converter_ctrl_loop(); // Run the control loop to adjust the PWM output as needed.
+    if(sensor_values.battery_temp_filt <= SYSTEM_OVERTEMP_LIMIT){
+      converter_ctrl_loop(); // Run the control loop to adjust the PWM output as needed.
+    }
+    else{
+      /*** OVERTEMP! Shut everything off, and keep it off as long as the overtemp condition exists ***/
+      if(converter.state != CONVSTATE_OVERTEMP){
+        converter_pwm_set(0);
+        led.state = LEDS_FVF_ON;
+        digitalWrite(PVENAPIN, true);
+        converter.system_load_enabled = false;
+        converter.state = CONVSTATE_OVERTEMP;
+      }
+    }
+    
+
   }
  
   if(ticks++ >= 99){
   
     ticks = 0;
+  
     
     // This is a debug aid. It prints out variables every second.
     //debug(0, "Battery Millivolts raw %u", sensor_values.batt_mv);
@@ -1363,6 +1398,7 @@ void loop()
     //debug(0, "Charge timer: %u", read_timer(&timer.charge));
     //debug(0, "Converter Energy (mWh): %u", (uint32_t) ((sensor_values.conv_energy/((uint64_t)3600*100))));
     //debug(0, "Battery Charge (mAh): %u", (uint32_t) ((sensor_values.battery_charge/((uint64_t)3600*100))));
+    //debug(0, "Raw battery temperature %u\n", sensor_values.battery_temp);
     //debug(0,"\r\n");
     
   }
