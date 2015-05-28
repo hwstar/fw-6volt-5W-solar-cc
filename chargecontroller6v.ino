@@ -105,7 +105,7 @@
 
 #define BULK_RESCAN_TIME 3000                          // Time between rescans (10 ms ticks)
 #define BULK_POWER_DIP_TIME 5000                       // Time to wait to validate a power dip in bulk charging mode
-#define BULK_TO_ABSORB_TIME 30000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
+#define BULK_TO_ABSORB_TIME 12000                      // Time to wait while checking battery voltage stays >= the end bulk charge voltage
 #define ABSORB_WAIT_TIME 2000                          // Time to wait in absorb state before going to previous or next state
 #define FLOAT_EXIT_TIME 5000                           // Time to wait in float state before going to previous state
 #define SWITCH_ON_TIME 5000                            // Number of milliseconds pv voltage needs to be above threshold switch on
@@ -122,7 +122,8 @@
 #define ABSORB_HYST 5                                  // Current hysteresis used in absorb charging state
 
 
-#define CONVERTER_PWM_CLIP 0xF0                        // Clip at current limit
+#define CONVERTER_PWM_CLIP 0xF0                        // Clip at maximum pwm duty cycle
+#define CONVERTER_CURRENT_CLIP 900                     // Maximum converter output current.
 
 #define ANALOG_FULL_SCALE 5000						             // Full scale voltage of an analog input
 
@@ -961,12 +962,15 @@ void converter_ctrl_loop(void)
             stop |= (converter.pwm >= converter_private.slow_scan_stop_pwm);
           }
           if(stop ||
-            (sensor_values.batt_mv_filt > converter.gassing_mv)){
-            // At max duty cycle, stop the scan
+            (sensor_values.batt_mv_filt > converter.gassing_mv) ||
+            (sensor_values.conv_ma_filt >= CONVERTER_CURRENT_CLIP)){
+            // At max duty cycle, battery gassing voltage, or
+            // at maximum output current. Stop the scan
             // Ensure it is over the minimum power
             if(converter.pwm_max_power < MIN_CONV_POWER){
               // Wait a prescribed amount of time before doing another scan
               converter_pwm_set(0);
+              digitalWrite(LOADENAPIN, false);
               set_timer(&timer.charge10, MIN_POWER_WAIT_TIME);
               converter.state = CONVSTATE_MIN_POWER_WAIT;
               break;
@@ -1061,7 +1065,7 @@ void converter_ctrl_loop(void)
       converter_pwm_set(converter.pwm_max_power);
       if((sensor_values.batt_mv_filt >= converter.end_bulk_mv) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
           // Exit bulk charging and go to absorbtion charging mode
-          set_timer(&timer.charge, BULK_TO_ABSORB_TIME);
+          set_timer(&timer.charge10, BULK_TO_ABSORB_TIME);
           converter.state = CONVSTATE_BULK_ABSORB;
       }    
       break;   
@@ -1071,7 +1075,7 @@ void converter_ctrl_loop(void)
       // Unless voltage or power dips.
       // If the gassing voltage is reached, terminate early and go to absorb state.
       converter_pwm_set(converter.pwm_max_power);
-      if((!read_timer(&timer.charge)) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
+      if((!read_timer(&timer.charge10)) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
         led.count = LED_ABSORB;
         led.state = LEDS_COUNT_ON;
         converter.state = CONVSTATE_ABSORB;
@@ -1132,10 +1136,13 @@ void converter_ctrl_loop(void)
       }
       
       // Servo to current unless voltage at terminal value. 
+      // Limit converter current to current clip value
       if(sensor_values.batt_mv_filt < converter.gassing_mv){
-        if((sensor_values.batt_ma_filt > (ABSORB_TARGET_CURRENT + ABSORB_HYST))) 
+        if((sensor_values.batt_ma_filt > (ABSORB_TARGET_CURRENT + ABSORB_HYST)) ||
+          (sensor_values.conv_ma_filt >= CONVERTER_CURRENT_CLIP))
           converter_pwm_set(converter.pwm - 1);
-        else if(sensor_values.batt_ma_filt < (ABSORB_TARGET_CURRENT - ABSORB_HYST)) 
+        else if((sensor_values.batt_ma_filt < (ABSORB_TARGET_CURRENT - ABSORB_HYST)) &&
+          (sensor_values.conv_ma_filt < CONVERTER_CURRENT_CLIP)) 
           converter_pwm_set(converter.pwm + 1);
       }
       else{
@@ -1159,14 +1166,16 @@ void converter_ctrl_loop(void)
       // Hold at float charge voltage
       if(CONVSTATE_FLOAT == converter.state){
         if((sensor_values.batt_mv_filt < converter.float_hold_mv - (FLOAT_HYST * 2)||
-          sensor_values.batt_ma_filt > ABSORB_TARGET_CURRENT)){
+          sensor_values.batt_ma_filt > ABSORB_TARGET_CURRENT) ||
+          (sensor_values.conv_ma_filt >= CONVERTER_CURRENT_CLIP)){
           converter.state = CONVSTATE_FLOAT_EXIT;
           timer.charge = FLOAT_EXIT_TIME;
         }
       }
       else{
         if(sensor_values.batt_mv_filt >= converter.float_hold_mv - (FLOAT_HYST * 2)&&
-          (sensor_values.batt_ma_filt < ABSORB_TARGET_CURRENT)){
+          (sensor_values.batt_ma_filt < ABSORB_TARGET_CURRENT) &&
+          (sensor_values.conv_ma_filt < CONVERTER_CURRENT_CLIP)){
           converter.state = CONVSTATE_FLOAT;
           break;
         }
