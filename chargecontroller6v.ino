@@ -140,6 +140,11 @@
 
 #define LED_FAST_BLINK 12                              // 240 ms blink period
 #define LED_VERY_FAST_BLINK 7                          // 140 ms blink period
+#define LED_COUNT_BLINK 24                             // 480 ms count period
+#define LED_COUNT_SLEEP_WAIT 1500                      // 15 Seconds between counts
+#define LED_BULK 3                                     // 3 flashes for bulk charge
+#define LED_ABSORB 2                                   // 2 flashes for absorb charge
+#define LED_FLOAT 1                                    // One flash for float charge
 
 #define CALIB_DWELL_TIME 200                           // Time to wait between increment/decrement of calibration value
 #define CALIB_V_HYST 5                                 // Hysteresis around calibration target
@@ -167,7 +172,9 @@ enum {CALIB_IDLE = 0, CALIB_PVV_START, CALIB_PVV_WAIT,
 enum {LEDC_OFF = 0, LEDC_ON, LED_FLASH_FAST};
 
 // LED states
-enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF, LEDS_FVF_ON, LEDS_FVF_OFF};
+enum {LEDS_OFF, LEDS_ON, LEDS_FF_ON, LEDS_FF_OFF, LEDS_FVF_ON, 
+LEDS_FVF_OFF, LEDS_COUNT_ON, LEDS_COUNT_ON_WAIT, LEDS_COUNT_OFF_WAIT, 
+LEDS_COUNT_SLEEP_WAIT};
 
 // Used by timer interrupt
 
@@ -289,7 +296,9 @@ typedef struct {
 
 typedef struct {
   uint8_t state;
-  uint8_t timer;
+  uint8_t count;
+  uint8_t counter;
+  uint16_t timer;
 } led_t;
 
 // Identification
@@ -369,11 +378,47 @@ void isr_timer1()
         }
         break;
       
-      case LEDS_FVF_ON:
+     case LEDS_FVF_ON:
        if(!led.timer){
           led.timer = LED_VERY_FAST_BLINK;
           digitalWrite(LEDPIN, false);
           led.state = LEDS_FVF_OFF;
+        }
+        break;
+
+      case LEDS_COUNT_ON:
+        led.counter = led.count;
+        digitalWrite(LEDPIN, true);
+        led.timer = LED_COUNT_BLINK;
+        led.state = LEDS_COUNT_ON_WAIT;
+        break;
+
+      case LEDS_COUNT_ON_WAIT:
+        if(!led.timer){
+          digitalWrite(LEDPIN, false);
+          led.timer = LED_COUNT_BLINK;
+          led.state = LEDS_COUNT_OFF_WAIT;
+        }
+        break;
+
+      case LEDS_COUNT_OFF_WAIT:
+        if(!led.timer){
+          led.counter--;
+          if(!led.counter){
+            led.timer = LED_COUNT_SLEEP_WAIT;
+            led.state = LEDS_COUNT_SLEEP_WAIT;
+          }
+          else{
+            led.timer = LED_COUNT_BLINK;
+            digitalWrite(LEDPIN, true);
+            led.state = LEDS_COUNT_ON_WAIT;
+          }
+        }
+        break;
+
+      case LEDS_COUNT_SLEEP_WAIT:
+        if(!led.timer){
+          led.state = LEDS_COUNT_ON;
         }
         break;
   }
@@ -876,6 +921,8 @@ void converter_ctrl_loop(void)
       break;
       
     case CONVSTATE_SCAN_START:
+      led.count = LED_BULK;
+      led.state = LEDS_COUNT_ON;
       converter_pwm_set(0);
       converter.pwm_max_power = 0;
       converter.max_power = 0;
@@ -1025,6 +1072,8 @@ void converter_ctrl_loop(void)
       // If the gassing voltage is reached, terminate early and go to absorb state.
       converter_pwm_set(converter.pwm_max_power);
       if((!read_timer(&timer.charge)) || (sensor_values.batt_mv_filt > converter.gassing_mv)){
+        led.count = LED_ABSORB;
+        led.state = LEDS_COUNT_ON;
         converter.state = CONVSTATE_ABSORB;
       }
       else if((sensor_values.conv_power_mw < (converter.pwm_max_power * 9)/10) || 
@@ -1035,7 +1084,6 @@ void converter_ctrl_loop(void)
       
      
     case CONVSTATE_ABSORB:
-
       switch(converter.servocurrentstate){
         case SRVCS_START:
           // See if battery voltage decreased to go to the previous state
@@ -1099,6 +1147,8 @@ void converter_ctrl_loop(void)
       // Taper down to float voltage
       converter_pwm_set(0);
       if(sensor_values.batt_mv_filt < converter.float_hold_mv + FLOAT_HYST){
+        led.count = LED_FLOAT;
+        led.state = LEDS_COUNT_ON;
         converter.state = CONVSTATE_FLOAT;
       }
       break;
@@ -1121,6 +1171,8 @@ void converter_ctrl_loop(void)
           break;
         }
         if(!timer.charge){
+          led.count = LED_ABSORB;
+          led.state = LEDS_COUNT_ON;
           converter.state = CONVSTATE_ABSORB;
           break;
         }
