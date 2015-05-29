@@ -1,9 +1,11 @@
-**fw-6volt-5W-solar-cc**
-
-*Introduction*
+***fw-6volt-5W-solar-cc***
+============
 
 This is the firmware to control my 6V solar charge controller
 (For the hardware, see my [6volt-5W-solar-cc project](https://github.com/hwstar/6volt-5W-solar-cc) )
+
+**Introduction**
+
 The charge controller firmware monitors the PV voltage, converter
 current, load current, and battery voltage and adjusts the PWM 
 output to keep the battery charging power at an optimum level
@@ -58,7 +60,7 @@ the Arduino you are using has a voltage regulator rated for 1% load
 regulation so that the analog sense voltages will be accurate. Arduinos
 using the MIC5205 5V regulator are preferred.
 
-*License*
+**License**
 
 GNU GPLv3
 
