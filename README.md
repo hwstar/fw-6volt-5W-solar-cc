@@ -1,9 +1,9 @@
-***fw-6volt-5W-solar-cc***
+**fw-6volt-5W-solar-cc**
 
-**Introduction**
+*Introduction*
 
 This is the firmware to control my 6V solar charge controller
-(For the hardware, see my 6volt-5W-solar-cc project)
+(For the hardware, see my [6volt-5W-solar-cc project](https://github.com/hwstar/6volt-5W-solar-cc) )
 The charge controller firmware monitors the PV voltage, converter
 current, load current, and battery voltage and adjusts the PWM 
 output to keep the battery charging power at an optimum level
@@ -50,7 +50,7 @@ source should be used to power the board during the calibration procedure.
 One can make such a source using an LM317 and a 3 1/2 digit DMM which
 is good enough to get a successful calibration result. I wrote
 a dedicated Python/tkinter utility perform the calibration using a 
-Buspirate. See chargectrlr-python-buspirate details.
+Buspirate. See [chargectrlr-python-buspirate](https://github.com/hwstar/chargectrlr-python-buspirate)
  
 This code was tested on an Arduino mini pro 328. With suitable
 modifications, it should run on any 5 volt Arduino, but make sure
@@ -58,7 +58,7 @@ the Arduino you are using has a voltage regulator rated for 1% load
 regulation so that the analog sense voltages will be accurate. Arduinos
 using the MIC5205 5V regulator are preferred.
 
-**License**
+*License*
 
 GNU GPLv3
 
