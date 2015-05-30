@@ -1,5 +1,28 @@
 
 /*
+*
+* Copyright 2015, Stephen Rodgers, all rights reserved. 
+* 
+* Steve Rodgers <steve-at-rodgers619-dot-com>
+* 
+* 
+* This program is free software; you can redistribute it and/or modify
+* it under the terms of the GNU General Public License as published by
+* the Free Software Foundation; either version 3 of the License, or
+* (at your option) any later version.
+* 
+* This program is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+* GNU General Public License for more details.
+* 
+* You should have received a copy of the GNU General Public License
+* along with this program; if not, write to the Free Software
+* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+* MA 02110-1301, USA.
+* 
+*=======================================================================
+* 
 * Arduino Solar charge controller for 6 volt lead acid batteries.
 * 
 * This is the firmware to control my 6V solar charge controller
@@ -125,14 +148,14 @@
 #define CONVERTER_PWM_CLIP 0xF0                        // Clip at maximum pwm duty cycle
 #define CONVERTER_CURRENT_CLIP 900                     // Maximum converter output current.
 
-#define ANALOG_FULL_SCALE 5000						             // Full scale voltage of an analog input
+#define ANALOG_FULL_SCALE 5000                         // Full scale voltage of an analog input
 
-#define PV_CAL_VOLTAGE 6000						                 // PV Calibration test voltage in mv
+#define PV_CAL_VOLTAGE 6000                            // PV Calibration test voltage in mv
 #define BATT_CAL_VOLTAGE 6000                          // Battery calibration test voltage in mv
 
 
-#define EEPROM_CALIB_ADDR 0xE0						             // Offset into EEPROM for calibration data
-#define EEPROM_CALIB_SIG 0x5AA5						             // Calibration signature
+#define EEPROM_CALIB_ADDR 0xE0                         // Offset into EEPROM for calibration data
+#define EEPROM_CALIB_SIG 0x5AA5                        // Calibration signature
 #define CAL_UPPER_LIMIT 5200                           // Upper cal limit
 #define CAL_LOWER_LIMIT 4800                           // Lower cal limit
 
